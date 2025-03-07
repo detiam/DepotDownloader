@@ -25,8 +25,7 @@ from multiprocessing.dummy import Pool, Lock
 from steam.core.manifest import DepotManifest
 from steam.core.crypto import symmetric_decrypt
 from steam.utils.web import make_requests_session
-from steam.client.cdn import get_content_servers_from_webapi
-from steam.protobufs.steammessages_clientserver_2_pb2 import CMsgClientGetCDNAuthTokenResponse
+from steam.client.cdn import CDNClient, get_content_servers_from_webapi
 
 parser = argparse.ArgumentParser(add_help=True)
 parser.add_argument('-t', '--thread-num', default=32)
@@ -283,11 +282,11 @@ class DepotDownloader:
     def __init__(self, manifest_path, depot_key, thread_num=32, save_path=None, servers=None,
                  level=logging.INFO, retry_num=3, expect_logged_in=False):
         self.lock = SingletonSemaphore(1)
-        self.cdn_auth_code_updating = False
         self.expect_logged_in = expect_logged_in
         if expect_logged_in:
             with self.lock:
                 self.client = SingletonSteamClient()
+        self.cdn = CDNClient(self.client)
         self.manifest_path = manifest_path
         self.depot_key = depot_key
         self.thread_num = thread_num
@@ -300,7 +299,6 @@ class DepotDownloader:
         self.manifest = DepotManifest(content)
         self.depot_id = self.manifest.depot_id
         self.servers = SingletonDeque()
-        self.servers_token = SingletonDict()
         self.get_content_server(servers)
         self.chunk_list_path = Path(f'{self.depot_id}.json')
         self.save_path = Path(save_path) if save_path else Path(str(self.depot_id))
@@ -322,8 +320,6 @@ class DepotDownloader:
                     if server_address not in self.servers:
                         self.log.info('Added server: ' + server_address)
                         self.servers.append(server_address)
-                    if self.expect_logged_in and server_address not in self.servers_token:
-                        self.update_cdn_token(server_address)
 
         if not self.servers:
             self.log.info("Trying to fetch content servers from Steam API")
@@ -341,9 +337,6 @@ class DepotDownloader:
                         self.log.info('Added server: ' + server_address)
                         # 将生成的服务器地址添加到 self.servers 列表中
                         self.servers.append(server_address)
-                    # 获取 CDN Auth Token
-                    if self.expect_logged_in and server_address not in self.servers_token:
-                        self.update_cdn_token(server_address)
 
         if not self.servers:
             raise SteamError("Failed to fetch content servers")
@@ -354,30 +347,8 @@ class DepotDownloader:
         server_address = self.servers[0]
         if self.expect_logged_in:
             with self.lock:
-                cdn_auth_token = self.servers_token[server_address]
-            assert (cdn_auth_token.eresult == EResult.OK)
-            if cdn_auth_token.expiration_time != 0:
-                timeleft = cdn_auth_token.expiration_time - time.time()
-                if timeleft < 60:
-                    try:
-                        with self.lock:
-                            cdn_auth_token = self.update_cdn_token(server_address)
-                    except SteamError:
-                        with self.lock:
-                            for server_address, cdn_auth_token in self.servers_token.items():
-                                if cdn_auth_token.eresult == EResult.OK:
-                                    break
-                            else:
-                                raise
-                elif timeleft < 300:  # 小于5分钟
-                    with self.lock:
-                        if not self.cdn_auth_code_updating:
-                            self.cdn_auth_code_updating = True
-                            gevent.spawn(lambda:
-                                         self.update_cdn_token(server_address) and
-                                         setattr(self, 'cdn_auth_code_updating', False))
-
-            return server_address, cdn_auth_token.token
+                cdn_auth_token = self.cdn.get_cdn_auth_token(0, self.depot_id, urlparse(str(server_address)).hostname)
+            return server_address, cdn_auth_token
         else:
             return server_address, ''
 
@@ -443,41 +414,6 @@ class DepotDownloader:
                 with self.lock:
                     pool.terminate()
                 self.save_chunk_dict()
-
-
-    def update_cdn_token(self, server_address):
-        retry = 3
-        while True:
-            try:
-                if not self.client.connected:
-                    self.client.anonymous_login()
-                hostname = urlparse(str(server_address)).hostname
-                if hostname.endswith('.steamcontent.com'):
-                    cdn_auth_token = CMsgClientGetCDNAuthTokenResponse()
-                    cdn_auth_token.token = ''
-                    cdn_auth_token.expiration_time = 0
-                    cdn_auth_token.eresult = EResult.OK
-                else:
-                    cdn_auth_token = self.client.get_cdn_auth_token(self.depot_id, hostname)
-                self.log.debug('Server: %s, Token: %s, expiration_time: %s, eresult: %s' % (
-                    server_address,
-                    cdn_auth_token.token,
-                    cdn_auth_token.expiration_time,
-                    EResult(cdn_auth_token.eresult).name
-                ))
-                if cdn_auth_token.eresult == EResult.OK:
-                    self.servers_token[server_address] = cdn_auth_token
-                    break
-                self.log.warning('Failed to get cdn_auth_token: %s, eresult: %s' % (
-                    server_address, EResult(cdn_auth_token.eresult).name))
-            except (NameError, AttributeError, TypeError, RuntimeError) as e:
-                if not retry:
-                    raise SteamError(f'Failed to get cdn_auth_token: {e}')
-                retry -= 1
-                # 如果'cdn_auth_token'为空或者没有.token和.eresult属性
-                self.client.disconnect()
-                self.client.anonymous_login()
-        return cdn_auth_token
 
 
 def get_manifest_path_depot_key_dict(path):
