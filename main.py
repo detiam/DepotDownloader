@@ -426,7 +426,7 @@ def get_manifest_path_depot_key_dict(path):
         if file.is_file():
             if file.suffix == '.manifest':
                 manifest_path_list.append(file)
-            elif file.name == 'config.vdf':
+            elif file.suffix == '.vdf':
                 with file.open() as f:
                     d = vdf.load(f)
                 depots = d.get('depots')
