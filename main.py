@@ -313,30 +313,30 @@ class DepotDownloader:
         self.tqdm = tqdm(total=self.manifest.metadata.cb_disk_original, unit='B', unit_scale=True)
         self.tqdm.set_description_str(f'Depot {self.depot_id}')
 
-    def get_content_server(self, servers=None, rotate=False):
+    def get_content_server(self, servers=None, rotate=False, cell_id=0, max_servers=20):
         if servers:
-            for server_address in servers:
+            for server_str in map(str, servers):
                 with self.lock:
-                    if server_address not in self.servers:
-                        self.log.info('Added server: ' + server_address)
-                        self.servers.append(server_address)
+                    if server_str not in self.servers:
+                        self.servers.append(server_str)
 
         if not self.servers:
-            self.log.info("Trying to fetch content servers from Steam API")
-            # 获取内容服务器信息
-            content_servers = filter(lambda server: server.type != 'OpenCache',
-                                     get_content_servers_from_webapi(b'0'))
-            # 优先 CDN 服务器
-            sorted_servers = sorted(content_servers, key=lambda server: server.type != 'CDN')
-            # 遍历每个服务器对象，生成服务器地址并获取对应的 CDN 认证令牌
-            for server in sorted_servers:
-                # 生成服务器地址
-                server_address = f"{'https' if server.https else 'http'}://{server.host}:{server.port}"
+            try:
+                resp = webapi_get('IContentServerDirectoryService', 'GetServersForSteamPipe',
+                                  params={'cell_id': cell_id, 'max_servers': max_servers})
+                content_servers = resp['response']['servers']
+                content_servers.sort(key=lambda x: (x['type'] != 'CDN', x['priority_class']))
+            except Exception:
+                raise
+
+            for server in filter(lambda x: not (
+                x['type'] == 'OpenCache' or x.get('steam_china_only', False)
+            ), content_servers):
+                server_str = f"{'https' if server['https_support'] == 'mandatory' else 'http'}://{server['host']}"
                 with self.lock:
-                    if server_address not in self.servers:
-                        self.log.info('Added server: ' + server_address)
-                        # 将生成的服务器地址添加到 self.servers 列表中
-                        self.servers.append(server_address)
+                    if server_str not in self.servers:
+                        self.servers.append(server_str)
+                        self.log.info('Appended server: ' + server_str)
 
         if not self.servers:
             raise SteamError("Failed to fetch content servers")
@@ -344,13 +344,11 @@ class DepotDownloader:
         if rotate:
             self.servers.rotate(-1)
 
-        server_address = self.servers[0]
+        server_str = str(self.servers[0])
         if self.expect_logged_in:
-            with self.lock:
-                cdn_auth_token = self.cdn.get_cdn_auth_token(0, self.depot_id, urlparse(str(server_address)).hostname)
-            return server_address, cdn_auth_token
+            return server_str, self.cdn.get_cdn_auth_token(0, self.depot_id, urlparse(server_str).hostname)
         else:
-            return server_address, ''
+            return server_str, ''
 
     def save_chunk_dict(self):
         with self.lock:
