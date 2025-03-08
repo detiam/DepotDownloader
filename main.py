@@ -14,27 +14,26 @@ from pathlib import Path
 from binascii import crc32
 from zipfile import ZipFile
 from collections import deque
-from steam.enums import EResult
 from gevent.lock import Semaphore
 from urllib.parse import urlparse
-from steam.client import SteamClient
-from steam.exceptions import SteamError
 from requests.adapters import HTTPAdapter
 from multiprocessing.pool import ThreadPool
 from multiprocessing.dummy import Pool, Lock
-from steam.core.manifest import DepotManifest
-from steam.core.crypto import symmetric_decrypt
-from steam.utils.web import make_requests_session
-from steam.client.cdn import CDNClient, get_content_servers_from_webapi
+
+from steam.utils.web import make_requests_session, APIHost, DEFAULT_PARAMS
 
 parser = argparse.ArgumentParser(add_help=True)
 parser.add_argument('-t', '--thread-num', default=32)
 parser.add_argument('-o', '--save-path')
 parser.add_argument('-c', '--login-anonymous', action='store_true',
-                    help='login anonymously and enable request cdn auth token')
+                    help=f'login anonymously and enable request cdn auth token')
 parser.add_argument('-s', '--server', dest='server_list', action='append', nargs='?')
+parser.add_argument('-a', '--apihost', default='Public',
+                    help=f'available: {APIHost._member_names_} or a custom string')
 parser.add_argument('-l', '--level', default='INFO')
 parser.add_argument('-r', '--retry-num', type=int, default=3)
+parser.add_argument('--use-http', action='store_true')
+parser.add_argument('--use-websocket', action='store_true')
 
 subparsers = parser.add_subparsers(dest='command', required=True)
 
@@ -44,6 +43,28 @@ app_parser.add_argument('-p', '--app-path', required=True)
 depot_parser = subparsers.add_parser('depot')
 depot_parser.add_argument('-m', '--manifest-path', dest='manifest_path_list', action='extend', nargs='+', required=True)
 depot_parser.add_argument('-k', '--depot-key', dest='depot_key_list', action='extend', nargs='+', required=True)
+
+args = parser.parse_args()
+
+DEFAULT_PARAMS['https'] = not args.use_http
+
+try:
+    DEFAULT_PARAMS['apihost'] = APIHost[args.apihost].value
+except:
+    DEFAULT_PARAMS['apihost'] = args.apihost
+
+# China apihost only support websocket
+if DEFAULT_PARAMS['apihost'] == APIHost.China.value:
+    args.use_websocket = True
+
+from steam.enums import EResult
+from steam.exceptions import SteamError
+from steam.webapi import get as webapi_get
+from steam.client import SteamClient
+from steam.client.cdn import CDNClient
+from steam.core.connection import WebsocketConnection
+from steam.core.manifest import DepotManifest
+from steam.core.crypto import symmetric_decrypt
 
 
 class ChunkDownload:
@@ -162,6 +183,8 @@ class SingletonSteamClient(SteamClient):
             self._initialized = True
             self._lock = Semaphore(1)
             super().__init__()
+            if args.use_websocket:
+                self.connection = WebsocketConnection()
             result = self.anonymous_login()
             if result != EResult.OK:
                 raise SteamError(f'Login failure reason: {result.__repr__()}')
@@ -286,7 +309,7 @@ class DepotDownloader:
         if expect_logged_in:
             with self.lock:
                 self.client = SingletonSteamClient()
-        self.cdn = CDNClient(self.client)
+                self.cdn = CDNClient(self.client)
         self.manifest_path = manifest_path
         self.depot_key = depot_key
         self.thread_num = thread_num
@@ -447,11 +470,10 @@ def get_manifest_path_depot_key_dict(path):
     return manifest_path_depot_key_dict
 
 
-def main(args=None):
-    if args:
-        args = parser.parse_args(args)
-    else:
-        args = parser.parse_args()
+def main(new_args=None):
+    global args
+    if new_args:
+        args = parser.parse_args(new_args)
     if args.level:
         level = logging.getLevelName(args.level.upper())
     else:
