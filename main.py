@@ -31,6 +31,7 @@ parser.add_argument('-c', '--login-anonymous', action='store_true',
 parser.add_argument('-s', '--server', type=str, dest='server_list', action='append', nargs='?')
 parser.add_argument('-a', '--apihost', type=str, default='Public',
                     help=f'available: {APIHost._member_names_} or a custom string')
+parser.add_argument('-i', '--appid', type=int, default=0)
 parser.add_argument('-l', '--level', type=str, default='INFO')
 parser.add_argument('-r', '--retry-num', type=int, default=3)
 parser.add_argument('--use-http', action='store_true')
@@ -140,7 +141,7 @@ class ChunkDownload:
                 elif 400 <= resp.status_code < 500:
                     raise SteamError("%s %s HTTP Error %s" % (self.path, chunk_id, resp.status_code))
             except Exception as exp:
-                self.log.debug("%s %s Request error (attempt %d/%d): %s", 
+                self.log.debug("%s %s Request error (attempt %d/%d): %s",
                              self.path, chunk_id, attempt+1, max_attempts, exp)
 
                 if attempt == max_attempts - 1:
@@ -291,7 +292,7 @@ class SingletonSemaphore(Semaphore):
 
 class DepotDownloader:
     def __init__(self, manifest_path, depot_key, thread_num=32, save_path=None, servers=None,
-                 level=logging.INFO, retry_num=0, expect_logged_in=False, max_servers=20):
+                 level=logging.INFO, retry_num=0, expect_logged_in=False, max_servers=20, appid=0):
         self.lock = SingletonSemaphore(1)
         self.expect_logged_in = expect_logged_in
         if expect_logged_in:
@@ -300,6 +301,7 @@ class DepotDownloader:
                 self.cdn = CDNClient(self.client)
         self.manifest_path = manifest_path
         self.depot_key = depot_key
+        self.appid = appid
         self.thread_num = int(thread_num)
         self.max_servers = int(max_servers)
         self.total_size = 0
@@ -358,7 +360,7 @@ class DepotDownloader:
 
         server_str = str(self.servers[0])
         if self.expect_logged_in:
-            return server_str, self.cdn.get_cdn_auth_token(0, self.depot_id, urlparse(server_str).hostname)
+            return server_str, self.cdn.get_cdn_auth_token(self.appid, self.depot_id, urlparse(server_str).hostname)
         else:
             return server_str, ''
 
@@ -460,7 +462,7 @@ def main(new_args=None):
         for manifest_path, depot_key in manifest_path_depot_key_dict.items():
             if manifest_path and depot_key:
                 d = DepotDownloader(manifest_path, depot_key, args.thread_num, save_path, server_set, level,
-                                    args.retry_num, args.login_anonymous)
+                                    args.retry_num, args.login_anonymous, 20, args.appid)
                 result_list.append(gevent.spawn(d.download))
         try:
             gevent.joinall(result_list)
