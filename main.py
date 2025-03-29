@@ -23,14 +23,14 @@ from multiprocessing.dummy import Pool, Lock
 from steam.utils.web import make_requests_session, APIHost, DEFAULT_PARAMS
 
 parser = argparse.ArgumentParser(add_help=True)
-parser.add_argument('-t', '--thread-num', default=32)
-parser.add_argument('-o', '--save-path')
+parser.add_argument('-t', '--thread-num', type=int, default=32)
+parser.add_argument('-o', '--save-path', type=str)
 parser.add_argument('-c', '--login-anonymous', action='store_true',
                     help=f'login anonymously and enable request cdn auth token')
-parser.add_argument('-s', '--server', dest='server_list', action='append', nargs='?')
-parser.add_argument('-a', '--apihost', default='Public',
+parser.add_argument('-s', '--server', type=str, dest='server_list', action='append', nargs='?')
+parser.add_argument('-a', '--apihost', type=str, default='Public',
                     help=f'available: {APIHost._member_names_} or a custom string')
-parser.add_argument('-l', '--level', default='INFO')
+parser.add_argument('-l', '--level', type=str, default='INFO')
 parser.add_argument('-r', '--retry-num', type=int, default=3)
 parser.add_argument('--use-http', action='store_true')
 parser.add_argument('--use-websocket', action='store_true')
@@ -38,11 +38,11 @@ parser.add_argument('--use-websocket', action='store_true')
 subparsers = parser.add_subparsers(dest='command', required=True)
 
 app_parser = subparsers.add_parser('app')
-app_parser.add_argument('-p', '--app-path', required=True)
+app_parser.add_argument('-p', '--app-path', type=str, required=True)
 
 depot_parser = subparsers.add_parser('depot')
-depot_parser.add_argument('-m', '--manifest-path', dest='manifest_path_list', action='extend', nargs='+', required=True)
-depot_parser.add_argument('-k', '--depot-key', dest='depot_key_list', action='extend', nargs='+', required=True)
+depot_parser.add_argument('-m', '--manifest-path', type=str, dest='manifest_path_list', action='extend', nargs='+', required=True)
+depot_parser.add_argument('-k', '--depot-key', type=str, dest='depot_key_list', action='extend', nargs='+', required=True)
 
 args = parser.parse_args()
 
