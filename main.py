@@ -85,85 +85,66 @@ class ChunkDownload:
 
     def download(self, chunk):
         chunk_id = chunk.sha.hex()
-        try:
-            data = self.get_chunk(chunk_id)
-            with self.depot_downloader.lock:
-                self.download_size += chunk.cb_original
-                self.depot_downloader.total_size += chunk.cb_original
-                self.log.debug(
-                    f'{self.path} {chunk_id} {self.download_size / self.mapping.size * 100:.2f}%/'
-                    f'{self.depot_downloader.total_size / self.manifest.metadata.cb_disk_original * 100:.2f}%')
-            with self.lock:
-                retry_count = 0
-                max_retries = 3
-                while retry_count < max_retries:
-                    try:
-                        with self.path.open('rb+') as f:
-                            f.seek(chunk.offset, 0)
-                            f.write(data)
-                        break
-                    except PermissionError:
-                        retry_count += 1
-                        time.sleep(0.5)
-                        if retry_count >= max_retries:
-                            self.log.error(f"Failed to write to {self.path} after {max_retries} retries")
-                            raise
-            
-            self.chunk_dict[self.filepa].append(f'{chunk.offset}_{chunk.sha.hex()}')
-            self.tqdm.set_postfix(filename=self.mapping.filename[-(shutil.get_terminal_size().columns // 4):])
-            self.tqdm.update(chunk.cb_original)
-        except Exception as e:
-            self.log.error(f"Error downloading chunk {chunk_id}: {str(e)}")
-            # Re-raise to trigger error_callback
-            raise
+        data = self.get_chunk(chunk_id)
+        with self.depot_downloader.lock:
+            self.download_size += chunk.cb_original
+            self.depot_downloader.total_size += chunk.cb_original
+            self.log.debug(
+                f'{self.path} {chunk_id} {self.download_size / self.mapping.size * 100:.2f}%/'
+                f'{self.depot_downloader.total_size / self.manifest.metadata.cb_disk_original * 100:.2f}%')
+        with self.lock:
+            while True:
+                try:
+                    with self.path.open('rb+') as f:
+                        f.seek(chunk.offset, 0)
+                        f.write(data)
+                    break
+                except PermissionError:
+                    pass
+        self.chunk_dict[self.filepa].append(f'{chunk.offset}_{chunk.sha.hex()}')
+        self.tqdm.set_postfix(filename=self.mapping.filename[-(shutil.get_terminal_size().columns // 4):])
+        self.tqdm.update(chunk.cb_original)
 
     def get_chunk(self, chunk_id):
         server, token = self.depot_downloader.get_content_server()
-        
-        max_attempts = 5
-        for attempt in range(max_attempts):
+
+        while True:
             url = f'{server}/depot/{self.depot_id}/chunk/{chunk_id}{token}'
             try:
-                resp = self.depot_downloader.web.get(url, timeout=30)  # Increased timeout
-                
+                resp = self.depot_downloader.web.get(url, timeout=10)
+            except Exception as exp:
+                self.log.debug("%s %s Request error: %s", self.path, chunk_id, exp)
+            else:
                 if resp.ok:
-                    data = symmetric_decrypt(resp.content, bytes.fromhex(self.depot_key))
-                    
-                    if data[:2] == b'VZ':
-                        if data[-2:] != b'zv':
-                            raise SteamError("%s %s VZ: Invalid footer: %s" % (self.path, chunk_id, repr(data[-2:])))
-                        if data[2:3] != b'a':
-                            raise SteamError("%s %s VZ: Invalid version: %s" % (self.path, chunk_id, repr(data[2:3])))
-
-                        vzfilter = lzma._decode_filter_properties(lzma.FILTER_LZMA1, data[7:12])
-                        vzdec = lzma.LZMADecompressor(lzma.FORMAT_RAW, filters=[vzfilter])
-                        checksum, decompressed_size = struct.unpack('<II', data[-10:-2])
-                        # decompress_size is needed since lzma will sometime produce longer output
-                        # [12:-9] is need as sometimes lzma will produce shorter output
-                        # together they get us the right data
-                        data = vzdec.decompress(data[12:-9])[:decompressed_size]
-                        if crc32(data) != checksum:
-                            raise SteamError("%s %s VZ: CRC32 checksum doesn't match for decompressed data" % (self.path, chunk_id))
-                    else:
-                        with ZipFile(BytesIO(data)) as zf:
-                            data = zf.read(zf.filelist[0])
-                    
-                    return data
+                    break
                 elif 400 <= resp.status_code < 500:
                     self.log.debug("%s %s Got HTTP %s", self.path, chunk_id, resp.status_code)
                     raise SteamError("%s %s HTTP Error %s" % (self.path, chunk_id, resp.status_code))
-            except Exception as exp:
-                self.log.debug("%s %s Request error (attempt %d/%d): %s", 
-                             self.path, chunk_id, attempt+1, max_attempts, exp)
-                
-                if attempt == max_attempts - 1:
-                    raise
-            
-            # Get a new server for the next attempt
-            time.sleep(1)  # Add a delay before retrying
-            server, token = self.depot_downloader.get_content_server(rotate=True)
-        
-        raise SteamError(f"Failed to download chunk {chunk_id} after {max_attempts} attempts")
+                time.sleep(0.5)
+            server = self.depot_downloader.get_content_server(rotate=True)
+
+        data = symmetric_decrypt(resp.content, bytes.fromhex(self.depot_key))
+
+        if data[:2] == b'VZ':
+            if data[-2:] != b'zv':
+                raise SteamError("%s %s VZ: Invalid footer: %s" % (self.path, chunk_id, repr(data[-2:])))
+            if data[2:3] != b'a':
+                raise SteamError("%s %s VZ: Invalid version: %s" % (self.path, chunk_id, repr(data[2:3])))
+
+            vzfilter = lzma._decode_filter_properties(lzma.FILTER_LZMA1, data[7:12])
+            vzdec = lzma.LZMADecompressor(lzma.FORMAT_RAW, filters=[vzfilter])
+            checksum, decompressed_size = struct.unpack('<II', data[-10:-2])
+            # decompress_size is needed since lzma will sometime produce longer output
+            # [12:-9] is need as sometimes lzma will produce shorter output
+            # together they get us the right data
+            data = vzdec.decompress(data[12:-9])[:decompressed_size]
+            if crc32(data) != checksum:
+                raise SteamError("%s %s VZ: CRC32 checksum doesn't match for decompressed data" % (self.path, chunk_id))
+        else:
+            with ZipFile(BytesIO(data)) as zf:
+                data = zf.read(zf.filelist[0])
+
+        return data
 
     def error_callback(self, e):
         self.log.error(''.join(traceback.TracebackException.from_exception(e).format()))
@@ -378,59 +359,42 @@ class DepotDownloader:
             with open(self.chunk_list_path, 'w', encoding='utf-8') as f:
                 json.dump(self.chunk_dict, f)
 
-
-
-
     def download(self):
         result_list = []
         with Pool(int(self.thread_num)) as pool:
             pool: ThreadPool
-            try:
-                for mapping in self.manifest.payload.mappings:
-                    mapping.chunks.sort(key=lambda x: x.offset)
-                    d = ChunkDownload(self, mapping)
-                    filepa = mapping.filename.replace('\\', '/')
-                    path = self.save_path / filepa
-                    if mapping.flags != 64:
+            for mapping in self.manifest.payload.mappings:
+                mapping.chunks.sort(key=lambda x: x.offset)
+                d = ChunkDownload(self, mapping)
+                filepa = mapping.filename.replace('\\', '/')
+                path = self.save_path / filepa
+                if mapping.flags != 64:
+                    if not path.exists():
+                        if filepa in self.chunk_dict:
+                            self.chunk_dict[filepa] = []
+                            self.save_chunk_dict()
+                        if not path.parent.exists():
+                            path.parent.mkdir(parents=True, exist_ok=True)
                         if not path.exists():
-                            if filepa in self.chunk_dict:
-                                self.chunk_dict[filepa] = []
-                                self.save_chunk_dict()
-                            if not path.parent.exists():
-                                path.parent.mkdir(parents=True, exist_ok=True)
-                            if not path.exists():
-                                path.touch(exist_ok=True)
-                    if filepa not in self.chunk_dict:
-                        self.chunk_dict[filepa] = []
-                    for chunk in mapping.chunks:
-                        if f'{chunk.offset}_{chunk.sha.hex()}' not in self.chunk_dict[filepa]:
-                            result_list.append(
-                                pool.apply_async(d.download, (chunk,), error_callback=d.error_callback))
-                        else:
-                            with self.lock:
-                                self.total_size += chunk.cb_original
-                            self.tqdm.update(chunk.cb_original)
-                  
-                # Monitor results with timeout
-                timeout = time.time() + 600  # 10 minute timeout per batch
+                            path.touch(exist_ok=True)
+                if filepa not in self.chunk_dict:
+                    self.chunk_dict[filepa] = []
+                for chunk in mapping.chunks:
+                    if f'{chunk.offset}_{chunk.sha.hex()}' not in self.chunk_dict[filepa]:
+                        result_list.append(
+                            pool.apply_async(d.download, (chunk,), error_callback=d.error_callback))
+                    else:
+                        with self.lock:
+                            self.total_size += chunk.cb_original
+                        self.tqdm.update(chunk.cb_original)
+            try:
                 while pool._state == 'RUN':
                     if all([result.ready() for result in result_list]):
                         break
-                        
-                    # Check for timeout
-                    if time.time() > timeout:
-                        self.log.warning("Download operation taking too long, saving progress and continuing")
-                        self.save_chunk_dict()
-                        # Clear completed results and reset timeout
-                        result_list = [r for r in result_list if not r.ready()]
-                        timeout = time.time() + 600
-                        
                     self.save_chunk_dict()
                     gevent.sleep(0.1)
             except KeyboardInterrupt:
-                self.log.info("Download interrupted by user")
-            except Exception as e:
-                self.log.error(f"Error in download process: {str(e)}")
+                pass
             finally:
                 with self.lock:
                     pool.terminate()
@@ -499,7 +463,7 @@ def main(new_args=None):
                                     args.retry_num, args.login_anonymous)
                 result_list.append(gevent.spawn(d.download))
         try:
-            gevent.joinall(result_list, timeout=300)
+            gevent.joinall(result_list)
         except KeyboardInterrupt:
             pass
 
