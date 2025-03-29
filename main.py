@@ -284,7 +284,7 @@ class SingletonSemaphore(Semaphore):
 
 class DepotDownloader:
     def __init__(self, manifest_path, depot_key, thread_num=32, save_path=None, servers=None,
-                 level=logging.INFO, retry_num=3, expect_logged_in=False):
+                 level=logging.INFO, retry_num=0, expect_logged_in=False, max_servers=20):
         self.lock = SingletonSemaphore(1)
         self.expect_logged_in = expect_logged_in
         if expect_logged_in:
@@ -293,7 +293,8 @@ class DepotDownloader:
                 self.cdn = CDNClient(self.client)
         self.manifest_path = manifest_path
         self.depot_key = depot_key
-        self.thread_num = thread_num
+        self.thread_num = int(thread_num)
+        self.max_servers = int(max_servers)
         self.total_size = 0
         self.log = logging.getLogger(self.__class__.__name__)
         logging.basicConfig(format='%(asctime)s - %(pathname)s[line:%(lineno)d] - %(levelname)s: %(message)s',
@@ -311,13 +312,13 @@ class DepotDownloader:
             with self.chunk_list_path.open(encoding='utf-8') as f:
                 self.chunk_dict = json.load(f)
         self.web = make_requests_session()
-        adapters = HTTPAdapter(max_retries=retry_num, pool_connections=10000, pool_maxsize=10000)
+        adapters = HTTPAdapter(max_retries=retry_num, pool_connections=self.max_servers, pool_maxsize=self.thread_num, pool_block=True)
         self.web.mount('http://', adapters)
         self.web.mount('https://', adapters)
         self.tqdm = tqdm(total=self.manifest.metadata.cb_disk_original, unit='B', unit_scale=True)
         self.tqdm.set_description_str(f'Depot {self.depot_id}')
 
-    def get_content_server(self, servers=None, rotate=False, cell_id=0, max_servers=20):
+    def get_content_server(self, servers=None, rotate=False, cell_id=0):
         if servers:
             for server_str in map(str, servers):
                 with self.lock:
@@ -327,7 +328,7 @@ class DepotDownloader:
         if not self.servers:
             try:
                 resp = webapi_get('IContentServerDirectoryService', 'GetServersForSteamPipe',
-                                  params={'cell_id': cell_id, 'max_servers': max_servers})
+                                  params={'cell_id': cell_id, 'max_servers': self.max_servers})
                 content_servers = resp['response']['servers']
                 content_servers.sort(key=lambda x: (x['type'] != 'CDN', x['priority_class']))
             except Exception:
@@ -361,7 +362,7 @@ class DepotDownloader:
 
     def download(self):
         result_list = []
-        with Pool(int(self.thread_num)) as pool:
+        with Pool(self.thread_num) as pool:
             pool: ThreadPool
             for mapping in self.manifest.payload.mappings:
                 mapping.chunks.sort(key=lambda x: x.offset)
