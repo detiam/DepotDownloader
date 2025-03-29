@@ -361,11 +361,6 @@ class DepotDownloader:
         else:
             return server_str, ''
 
-    def save_chunk_dict(self):
-        with self.lock:
-            with open(self.chunk_list_path, 'w', encoding='utf-8') as f:
-                json.dump(self.chunk_dict, f)
-
     def download(self):
         result_list = []
         with Pool(self.thread_num) as pool:
@@ -379,7 +374,6 @@ class DepotDownloader:
                     if not path.exists():
                         if filepa in self.chunk_dict:
                             self.chunk_dict[filepa] = []
-                            self.save_chunk_dict()
                         if not path.parent.exists():
                             path.parent.mkdir(parents=True, exist_ok=True)
                         if not path.exists():
@@ -395,17 +389,15 @@ class DepotDownloader:
                             self.total_size += chunk.cb_original
                         self.tqdm.update(chunk.cb_original)
             try:
-                while pool._state == 'RUN':
-                    if all([result.ready() for result in result_list]):
-                        break
-                    self.save_chunk_dict()
-                    gevent.sleep(0.1)
+                pool.close()
+                pool.join()
             except KeyboardInterrupt:
                 pass
             finally:
                 with self.lock:
+                    with open(self.chunk_list_path, 'w', encoding='utf-8') as f:
+                        json.dump(self.chunk_dict, f)
                     pool.terminate()
-                self.save_chunk_dict()
 
 
 def get_manifest_path_depot_key_dict(path):
