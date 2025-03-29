@@ -8,6 +8,7 @@ import struct
 import logging
 import argparse
 import traceback
+from sys import exit
 from tqdm import tqdm
 from io import BytesIO
 from pathlib import Path
