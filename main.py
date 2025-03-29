@@ -105,49 +105,55 @@ class ChunkDownload:
         self.tqdm.set_postfix(filename=self.mapping.filename[-(shutil.get_terminal_size().columns // 4):])
         self.tqdm.update(chunk.cb_original)
 
-    def get_chunk(self, chunk_id):
+    def get_chunk(self, chunk_id, max_attempts=5):
         server, token = self.depot_downloader.get_content_server()
 
-        while True:
+        for attempt in range(max_attempts):
             url = f'{server}/depot/{self.depot_id}/chunk/{chunk_id}{token}'
             try:
                 resp = self.depot_downloader.web.get(url, timeout=10)
-            except Exception as exp:
-                self.log.debug("%s %s Request error: %s", self.path, chunk_id, exp)
-            else:
+
                 if resp.ok:
-                    break
+                    data = symmetric_decrypt(resp.content, bytes.fromhex(self.depot_key))
+
+                    if data[:2] == b'VZ':
+                        if data[-2:] != b'zv':
+                            raise SteamError("%s %s VZ: Invalid footer: %s" % (self.path, chunk_id, repr(data[-2:])))
+                        if data[2:3] != b'a':
+                            raise SteamError("%s %s VZ: Invalid version: %s" % (self.path, chunk_id, repr(data[2:3])))
+
+                        vzfilter = lzma._decode_filter_properties(lzma.FILTER_LZMA1, data[7:12])
+                        vzdec = lzma.LZMADecompressor(lzma.FORMAT_RAW, filters=[vzfilter])
+                        checksum, decompressed_size = struct.unpack('<II', data[-10:-2])
+                        # decompress_size is needed since lzma will sometime produce longer output
+                        # [12:-9] is need as sometimes lzma will produce shorter output
+                        # together they get us the right data
+                        data = vzdec.decompress(data[12:-9])[:decompressed_size]
+                        if crc32(data) != checksum:
+                            raise SteamError("%s %s VZ: CRC32 checksum doesn't match for decompressed data" % (self.path, chunk_id))
+                    else:
+                        with ZipFile(BytesIO(data)) as zf:
+                            data = zf.read(zf.filelist[0])
+
+                    return data
                 elif 400 <= resp.status_code < 500:
-                    self.log.debug("%s %s Got HTTP %s", self.path, chunk_id, resp.status_code)
                     raise SteamError("%s %s HTTP Error %s" % (self.path, chunk_id, resp.status_code))
-                time.sleep(0.5)
-            server = self.depot_downloader.get_content_server(rotate=True)
+            except Exception as exp:
+                self.log.debug("%s %s Request error (attempt %d/%d): %s", 
+                             self.path, chunk_id, attempt+1, max_attempts, exp)
 
-        data = symmetric_decrypt(resp.content, bytes.fromhex(self.depot_key))
+                if attempt == max_attempts - 1:
+                    raise
 
-        if data[:2] == b'VZ':
-            if data[-2:] != b'zv':
-                raise SteamError("%s %s VZ: Invalid footer: %s" % (self.path, chunk_id, repr(data[-2:])))
-            if data[2:3] != b'a':
-                raise SteamError("%s %s VZ: Invalid version: %s" % (self.path, chunk_id, repr(data[2:3])))
+            # Get a new server for the next attempt
+            time.sleep(1)  # Add a delay before retrying
+            server, token = self.depot_downloader.get_content_server(rotate=True)
 
-            vzfilter = lzma._decode_filter_properties(lzma.FILTER_LZMA1, data[7:12])
-            vzdec = lzma.LZMADecompressor(lzma.FORMAT_RAW, filters=[vzfilter])
-            checksum, decompressed_size = struct.unpack('<II', data[-10:-2])
-            # decompress_size is needed since lzma will sometime produce longer output
-            # [12:-9] is need as sometimes lzma will produce shorter output
-            # together they get us the right data
-            data = vzdec.decompress(data[12:-9])[:decompressed_size]
-            if crc32(data) != checksum:
-                raise SteamError("%s %s VZ: CRC32 checksum doesn't match for decompressed data" % (self.path, chunk_id))
-        else:
-            with ZipFile(BytesIO(data)) as zf:
-                data = zf.read(zf.filelist[0])
-
-        return data
+        raise SteamError(f"Failed to download chunk {chunk_id} after {max_attempts} attempts")
 
     def error_callback(self, e):
         self.log.error(''.join(traceback.TracebackException.from_exception(e).format()))
+        exit(1)
 
 
 class SingletonSteamClient(SteamClient):
