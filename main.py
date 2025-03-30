@@ -25,6 +25,8 @@ from steam.utils.web import make_requests_session, APIHost, DEFAULT_PARAMS
 
 parser = argparse.ArgumentParser(add_help=True)
 parser.add_argument('-t', '--thread-num', type=int, default=32)
+parser.add_argument('-f', '--file-open-num', type=int, default=32,
+                    help=f'the number of how many file can be write same time, should smaller than thread-num')
 parser.add_argument('-o', '--save-path', type=str)
 parser.add_argument('-c', '--login-anonymous', action='store_true',
                     help=f'login anonymously and enable request cdn auth token')
@@ -309,7 +311,8 @@ class SingletonSemaphore(Semaphore):
 
 class DepotDownloader:
     def __init__(self, manifest_path, depot_key, thread_num=32, save_path=None, servers=None,
-                 level=logging.INFO, retry_num=0, expect_logged_in=False, max_servers=20, appid=0):
+                 level=logging.INFO, retry_num=3, expect_logged_in=False, max_servers=20, appid=0,
+                 file_open_num=32):
         self.lock = SingletonSemaphore(1)
         self.expect_logged_in = expect_logged_in
         if expect_logged_in:
@@ -320,6 +323,7 @@ class DepotDownloader:
         self.depot_key = depot_key
         self.appid = appid
         self.thread_num = int(thread_num)
+        self.file_open_num = int(file_open_num)
         self.max_servers = int(max_servers)
         self.total_size = 0
         self.log = logging.getLogger(self.__class__.__name__)
@@ -398,13 +402,13 @@ class DepotDownloader:
 
     def download(self):
         with ThreadPool(self.thread_num) as connection_pool:
-            with ThreadPool(300) as file_pool:
+            with ThreadPool( # connection_pool should bigger than file_pool
+                self.file_open_num if self.thread_num >= self.file_open_num else self.thread_num) as file_pool:
                 for mapping in self.manifest.payload.mappings:
                     file_pool.apply_async(
                         self.download_file,
                         (mapping, connection_pool,),
-                        error_callback=self.error_callback
-                    )
+                        error_callback=self.error_callback)
                 try:
                     file_pool.close()
                     file_pool.join()
@@ -478,7 +482,7 @@ def main(new_args=None):
         for manifest_path, depot_key in manifest_path_depot_key_dict.items():
             if manifest_path and depot_key:
                 d = DepotDownloader(manifest_path, depot_key, args.thread_num, save_path, server_set, level,
-                                    args.retry_num, args.login_anonymous, 20, args.appid)
+                                    args.retry_num, args.login_anonymous, 20, args.appid, args.file_open_num)
                 result_list.append(gevent.spawn(d.download))
         try:
             gevent.joinall(result_list)
