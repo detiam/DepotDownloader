@@ -19,7 +19,7 @@ from gevent.lock import Semaphore
 from urllib.parse import urlparse
 from requests.adapters import HTTPAdapter
 from multiprocessing.pool import ThreadPool
-from multiprocessing.dummy import Pool, Lock
+from multiprocessing.dummy import Lock
 
 from steam.utils.web import make_requests_session, APIHost, DEFAULT_PARAMS
 
@@ -69,42 +69,63 @@ from steam.core.manifest import DepotManifest
 from steam.core.crypto import symmetric_decrypt
 
 
-class ChunkDownload:
-    def __init__(self, depot_downloader, mapping):
+class FileDownload:
+    def __init__(self, depot_downloader, filemapping):
         self.depot_downloader = depot_downloader
         self.tqdm: tqdm = self.depot_downloader.tqdm
         self.manifest = self.depot_downloader.manifest
-        self.mapping = mapping
+        self.filemapping = filemapping
         self.download_size = 0
         self.chunk_dict = self.depot_downloader.chunk_dict
         self.chunk_list_path = self.depot_downloader.chunk_list_path
         self.depot_id = self.depot_downloader.depot_id
         self.depot_key = self.depot_downloader.depot_key
         self.log = self.depot_downloader.log
-        self.filepa = self.mapping.filename.replace('\\', '/')
-        self.path = self.depot_downloader.save_path / self.filepa
+        self.filepath = self.filemapping.filename.replace('\\', '/')
+        self.path = self.depot_downloader.save_path / self.filepath
         self.lock = Lock()
 
-    def download(self, chunk):
+        if filemapping.flags != 64:
+            if not self.path.exists():
+                if self.filepath in self.chunk_dict:
+                    self.chunk_dict[self.filepath] = []
+                if not self.path.parent.exists():
+                    self.path.parent.mkdir(parents=True, exist_ok=True)
+                if not self.path.exists():
+                    self.path.touch(exist_ok=True)
+            try:
+                self.path_f = self.path.open('rb+')
+            except PermissionError:
+                self.log.error(f'Open {self.path} failed!')
+                exit(1)
+        if self.filepath not in self.chunk_dict:
+            self.chunk_dict[self.filepath] = []
+
+    #def download_file():
+
+    def download_chunk_and_save(self, chunk):
         chunk_id = chunk.sha.hex()
         data = self.get_chunk(chunk_id)
         with self.depot_downloader.lock:
             self.download_size += chunk.cb_original
             self.depot_downloader.total_size += chunk.cb_original
-            self.log.debug(
-                f'{self.path} {chunk_id} {self.download_size / self.mapping.size * 100:.2f}%/'
-                f'{self.depot_downloader.total_size / self.manifest.metadata.cb_disk_original * 100:.2f}%')
+            #self.log.debug(
+            #    f'{self.path} {chunk_id} {self.download_size / self.filemapping.size * 100:.2f}%/'
+            #    f'{self.depot_downloader.total_size / self.manifest.metadata.cb_disk_original * 100:.2f}%')
         with self.lock:
             while True:
-                try:
-                    with self.path.open('rb+') as f:
-                        f.seek(chunk.offset, 0)
-                        f.write(data)
+                try:                
+                    self.path_f.seek(chunk.offset, 0)
+                    self.path_f.write(data)
                     break
-                except PermissionError:
+                except Exception:
+                    if not self.path_f:
+                        self.log.error('Need open file first')
+                        exit(1)
+                    self.log.warning(f'Save chunk {chunk_id} to {self.filepath} failed, retry...')
                     pass
-        self.chunk_dict[self.filepa].append(f'{chunk.offset}_{chunk.sha.hex()}')
-        self.tqdm.set_postfix(filename=self.mapping.filename[-(shutil.get_terminal_size().columns // 4):])
+        self.chunk_dict[self.filepath].append(f'{chunk.offset}_{chunk.sha.hex()}')
+        self.tqdm.set_postfix(filename=self.filepath[-(shutil.get_terminal_size().columns // 4):])
         self.tqdm.update(chunk.cb_original)
 
     def get_chunk(self, chunk_id, max_attempts=5):
@@ -152,10 +173,6 @@ class ChunkDownload:
             server, token = self.depot_downloader.get_content_server(rotate=True)
 
         raise SteamError(f"Failed to download chunk {chunk_id} after {max_attempts} attempts")
-
-    def error_callback(self, e):
-        self.log.error(''.join(traceback.TracebackException.from_exception(e).format()))
-        exit(1)
 
 
 class SingletonSteamClient(SteamClient):
@@ -364,43 +381,42 @@ class DepotDownloader:
         else:
             return server_str, ''
 
-    def download(self):
+    def download_file(self, filemapping, pool:ThreadPool):
+        filemapping.chunks.sort(key=lambda x: x.offset)
+        d = FileDownload(self, filemapping)
         result_list = []
-        with Pool(self.thread_num) as pool:
-            pool: ThreadPool
-            for mapping in self.manifest.payload.mappings:
-                mapping.chunks.sort(key=lambda x: x.offset)
-                d = ChunkDownload(self, mapping)
-                filepa = mapping.filename.replace('\\', '/')
-                path = self.save_path / filepa
-                if mapping.flags != 64:
-                    if not path.exists():
-                        if filepa in self.chunk_dict:
-                            self.chunk_dict[filepa] = []
-                        if not path.parent.exists():
-                            path.parent.mkdir(parents=True, exist_ok=True)
-                        if not path.exists():
-                            path.touch(exist_ok=True)
-                if filepa not in self.chunk_dict:
-                    self.chunk_dict[filepa] = []
-                for chunk in mapping.chunks:
-                    if f'{chunk.offset}_{chunk.sha.hex()}' not in self.chunk_dict[filepa]:
-                        result_list.append(
-                            pool.apply_async(d.download, (chunk,), error_callback=d.error_callback))
-                    else:
-                        with self.lock:
-                            self.total_size += chunk.cb_original
-                        self.tqdm.update(chunk.cb_original)
-            try:
-                pool.close()
-                pool.join()
-            except KeyboardInterrupt:
-                pass
-            finally:
+        for chunk in filemapping.chunks:
+            if f'{chunk.offset}_{chunk.sha.hex()}' not in self.chunk_dict[d.filepath]:
+                result_list.append(
+                    pool.apply_async(d.download_chunk_and_save, (chunk,), error_callback=self.error_callback))
+            else:
                 with self.lock:
+                    self.total_size += chunk.cb_original
+                self.tqdm.update(chunk.cb_original)
+        for result in result_list:
+            result.wait()
+
+    def download(self):
+        with ThreadPool(self.thread_num) as connection_pool:
+            with ThreadPool(300) as file_pool:
+                for mapping in self.manifest.payload.mappings:
+                    file_pool.apply_async(
+                        self.download_file,
+                        (mapping, connection_pool,),
+                        error_callback=self.error_callback
+                    )
+                try:
+                    file_pool.close()
+                    file_pool.join()
+                except KeyboardInterrupt:
+                    pass
+                finally:
                     with open(self.chunk_list_path, 'w', encoding='utf-8') as f:
                         json.dump(self.chunk_dict, f)
-                    pool.terminate()
+
+    def error_callback(self, e):
+        self.log.error(''.join(traceback.TracebackException.from_exception(e).format()))
+        exit(1)
 
 
 def get_manifest_path_depot_key_dict(path):
