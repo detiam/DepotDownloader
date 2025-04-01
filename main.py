@@ -77,7 +77,6 @@ class FileDownload:
         self.manifest = self.depot_downloader.manifest
         self.filemapping = filemapping
         self.chunk_dict = self.depot_downloader.chunk_dict
-        self.chunk_list_path = self.depot_downloader.chunk_list_path
         self.depot_id = self.depot_downloader.depot_id
         self.depot_key = self.depot_downloader.depot_key
         self.log = self.depot_downloader.log
@@ -190,7 +189,7 @@ class SingletonSteamClient(SteamClient):
                 raise SteamError(f'Login failure reason: {result.__repr__()}')
 
 
-class SingletonDict(dict):
+class SafeDict(dict):
     _instance = None
     _initialized = False
 
@@ -202,7 +201,7 @@ class SingletonDict(dict):
     def __init__(self, *args, **kwargs):
         if not self._initialized:
             self._initialized = True
-            self._lock = Semaphore(1)
+            self._lock = Lock()
             super().__init__(*args, **kwargs)
 
     def __getitem__(self, key):
@@ -326,12 +325,18 @@ class DepotDownloader:
         self.depot_id = self.manifest.depot_id
         self.servers = SingletonDeque()
         self.get_content_server(servers)
-        self.chunk_list_path = Path(f'{self.depot_id}.json')
+        self.chunk_dict_path = Path(f'{self.depot_id}.json')
         self.save_path = Path(save_path) if save_path else Path(str(self.depot_id))
-        self.chunk_dict = {}
-        if self.chunk_list_path.exists():
-            with self.chunk_list_path.open(encoding='utf-8') as f:
-                self.chunk_dict = json.load(f)
+        self.chunk_dict = SafeDict()
+        if self.chunk_dict_path.exists():
+            with self.chunk_dict_path.open(encoding='utf-8') as f:
+                self.chunk_dict = SafeDict(json.load(f))
+        else:
+            self.chunk_dict_path.touch()
+            with self.lock:
+                with self.chunk_dict_path.open('w', encoding='utf-8') as f:
+                        json.dump(self.chunk_dict, f)
+        self.chunk_dict_f = self.chunk_dict_path.open('w', encoding='utf-8')
         self.web = make_requests_session()
         adapters = HTTPAdapter(max_retries=retry_num, pool_connections=self.max_servers, pool_maxsize=self.thread_num, pool_block=True)
         self.web.mount('http://', adapters)
@@ -380,10 +385,12 @@ class DepotDownloader:
         filemapping.chunks.sort(key=lambda x: x.offset)
         d = FileDownload(self, filemapping)
         result_list = []
+        def savec(r):
+            self.save_chunk_dict()
         for chunk in filemapping.chunks:
             if f'{chunk.offset}_{chunk.sha.hex()}' not in self.chunk_dict[d.filepath]:
                 result_list.append(
-                    pool.apply_async(d.download_chunk_and_save, (chunk,), error_callback=self.error_callback))
+                    pool.apply_async(d.download_chunk_and_save, (chunk,), callback=savec, error_callback=self.error_callback))
             else:
                 self.tqdm.update(chunk.cb_original)
         for result in result_list:
@@ -404,8 +411,12 @@ class DepotDownloader:
                 except KeyboardInterrupt:
                     pass
                 finally:
-                    with open(self.chunk_list_path, 'w', encoding='utf-8') as f:
-                        json.dump(self.chunk_dict, f)
+                    self.save_chunk_dict()
+
+    def save_chunk_dict(self):
+        self.chunk_dict_f.seek(0)
+        json.dump(dict(self.chunk_dict), self.chunk_dict_f)
+        self.chunk_dict_f.flush()
 
     def error_callback(self, e):
         self.log.error(''.join(traceback.TracebackException.from_exception(e).format()))
