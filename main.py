@@ -1,4 +1,5 @@
 import vdf
+import sys
 import time
 import lzma
 import json
@@ -7,7 +8,6 @@ import struct
 import logging
 import argparse
 import traceback
-from sys import exit
 from tqdm import tqdm
 from io import BytesIO
 from pathlib import Path
@@ -97,7 +97,7 @@ class FileDownload:
                 self.path_f = self.path.open('rb+')
             except PermissionError:
                 self.log.error(f'Open {self.path} failed!')
-                exit(1)
+                sys.exit(1)
         if self.filepath not in self.chunk_dict:
             self.chunk_dict[self.filepath] = []
 
@@ -115,7 +115,7 @@ class FileDownload:
                 except Exception:
                     if not self.path_f:
                         self.log.error('Need open file first')
-                        exit(1)
+                        sys.exit(1)
                     self.log.warning(f'Save chunk {chunk_id} to {self.filepath} failed, retry...')
                     pass
         self.chunk_dict[self.filepath].append(f'{chunk.offset}_{chunk.sha.hex()}')
@@ -409,7 +409,7 @@ class DepotDownloader:
 
     def error_callback(self, e):
         self.log.error(''.join(traceback.TracebackException.from_exception(e).format()))
-        exit(1)
+        sys.exit(1)
 
 
 def get_manifest_path_depot_key_dict(path):
