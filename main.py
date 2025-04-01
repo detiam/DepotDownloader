@@ -76,7 +76,6 @@ class FileDownload:
         self.tqdm: tqdm = self.depot_downloader.tqdm
         self.manifest = self.depot_downloader.manifest
         self.filemapping = filemapping
-        self.download_size = 0
         self.chunk_dict = self.depot_downloader.chunk_dict
         self.chunk_list_path = self.depot_downloader.chunk_list_path
         self.depot_id = self.depot_downloader.depot_id
@@ -107,12 +106,6 @@ class FileDownload:
     def download_chunk_and_save(self, chunk):
         chunk_id = chunk.sha.hex()
         data = self.get_chunk(chunk_id)
-        with self.depot_downloader.lock:
-            self.download_size += chunk.cb_original
-            self.depot_downloader.total_size += chunk.cb_original
-            #self.log.debug(
-            #    f'{self.path} {chunk_id} {self.download_size / self.filemapping.size * 100:.2f}%/'
-            #    f'{self.depot_downloader.total_size / self.manifest.metadata.cb_disk_original * 100:.2f}%')
         with self.lock:
             while True:
                 try:                
@@ -324,7 +317,6 @@ class DepotDownloader:
         self.thread_num = int(thread_num)
         self.file_open_num = int(file_open_num)
         self.max_servers = int(max_servers)
-        self.total_size = 0
         self.log = logging.getLogger(self.__class__.__name__)
         logging.basicConfig(format='%(asctime)s - %(pathname)s[line:%(lineno)d] - %(levelname)s: %(message)s',
                             level=level)
@@ -393,8 +385,6 @@ class DepotDownloader:
                 result_list.append(
                     pool.apply_async(d.download_chunk_and_save, (chunk,), error_callback=self.error_callback))
             else:
-                with self.lock:
-                    self.total_size += chunk.cb_original
                 self.tqdm.update(chunk.cb_original)
         for result in result_list:
             result.wait()
