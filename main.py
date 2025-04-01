@@ -2,7 +2,6 @@ import vdf
 import time
 import lzma
 import json
-import gevent
 import shutil
 import struct
 import logging
@@ -478,17 +477,11 @@ def main(new_args=None):
             if type(server) == str:
                 server_set.update(server.split(','))
     if manifest_path_depot_key_dict:
-        result_list = []
         for manifest_path, depot_key in manifest_path_depot_key_dict.items():
             if manifest_path and depot_key:
                 d = DepotDownloader(manifest_path, depot_key, args.thread_num, save_path, server_set, level,
                                     args.retry_num, args.login_anonymous, 20, args.appid, args.file_open_num)
-                result_list.append(gevent.spawn(d.download))
-        try:
-            gevent.joinall(result_list)
-        except KeyboardInterrupt:
-            pass
-
+                d.download()
 
 if __name__ == '__main__':
     main()
