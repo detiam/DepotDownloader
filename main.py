@@ -325,10 +325,8 @@ class DepotDownloader:
         self.depot_id = self.manifest.depot_id
         self.servers = SingletonDeque()
         self.get_content_server(servers)
-        self.chunk_dict_path = Path(f'{self.depot_id}.json')
+        self.chunk_dict_path = self._get_chunk_saves()
         self.save_path = Path(save_path) if save_path else Path(str(self.depot_id))
-        if not self.chunk_dict_path.exists():
-            self.chunk_dict_path.touch()
         self.chunk_dict_f = self.chunk_dict_path.open('r+', encoding='utf-8')
         try:
             self.chunk_dict = SingletonDict(json.load(self.chunk_dict_f))
@@ -341,6 +339,21 @@ class DepotDownloader:
         self.web.mount('https://', adapters)
         self.tqdm = tqdm(total=self.manifest.metadata.cb_disk_original, unit='B', unit_scale=True)
         self.tqdm.set_description_str(f'Depot {self.depot_id}')
+
+    def _get_chunk_saves(self):
+        matching_files = [p for p in Path.cwd().glob(f'*% - {self.depot_id}.json') if p.is_file()]
+        matching_files.sort(key=lambda x: x.stat().st_mtime)
+        chunk_saves = None
+        if matching_files:
+            chunk_saves = matching_files.pop()
+            for file in matching_files:
+                file.unlink()
+
+        if not chunk_saves:
+            chunk_saves = Path(f'0% - {self.depot_id}.json')
+            chunk_saves.touch()
+
+        return chunk_saves
 
     def get_content_server(self, servers=None, rotate=False, cell_id=0):
         if servers:
@@ -420,7 +433,16 @@ class DepotDownloader:
             self.chunk_dict_f.seek(0)
             json.dump(dict(self.chunk_dict), self.chunk_dict_f)
             #self.chunk_dict_f.truncate()
-            self.chunk_dict_f.flush()
+
+            percentage = int(self.tqdm.n / self.tqdm.total * 100)
+            name = self.chunk_dict_path.with_name(f'{percentage}% - {self.depot_id}.json')
+            if self.chunk_dict_path != name:
+                self.chunk_dict_path = self.chunk_dict_path.rename(name)
+                self.chunk_dict_f.close()
+                self.chunk_dict_f = self.chunk_dict_path.open('r+', encoding='utf-8')
+            else:
+                self.chunk_dict_f.flush()
+                
 
 def get_manifest_path_depot_key_dict(path):
     path = Path(path)
