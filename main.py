@@ -1,5 +1,4 @@
 import vdf
-import sys
 import time
 import lzma
 import json
@@ -7,7 +6,6 @@ import shutil
 import struct
 import logging
 import argparse
-import traceback
 from tqdm import tqdm
 from io import BytesIO
 from pathlib import Path
@@ -90,11 +88,7 @@ class FileDownload:
                     self.path.parent.mkdir(parents=True, exist_ok=True)
                 if not self.path.exists():
                     self.path.touch(exist_ok=True)
-            try:
-                self.path_f = self.path.open('rb+')
-            except PermissionError:
-                self.log.error(f'Open {self.path} failed!')
-                sys.exit(1)
+            self.path_f = self.path.open('rb+')
         if self.filepath not in self.chunk_dict:
             self.chunk_dict[self.filepath] = []
 
@@ -110,9 +104,6 @@ class FileDownload:
                     self.path_f.write(data)
                 break
             except Exception:
-                if not self.path_f:
-                    self.log.error('Need open file first')
-                    sys.exit(1)
                 self.log.warning(f'Save chunk {chunk_id} to {self.filepath} failed, retry...')
                 pass
         self.chunk_dict[self.filepath].append(f'{chunk.offset}_{chunk.sha.hex()}')
@@ -368,12 +359,14 @@ class DepotDownloader:
                     pool.apply_async(
                         d.download_chunk_and_save,
                         (chunk, self.retry_num,),
-                        callback=self.save_chunk_dict,
-                        error_callback=self.error_callback))
+                        callback=self.save_chunk_dict))
             else:
                 self.tqdm.update(chunk.cb_original)
-        for result in result_list:
-            result.wait()
+        try:
+            for result in result_list:
+                result.get()
+        except KeyboardInterrupt:
+            pass
 
     def download(self):
         with Pool(self.thread_num) as connection_pool:
@@ -383,15 +376,12 @@ class DepotDownloader:
                     result_list.append(
                         file_pool.apply_async(
                             self.download_file,
-                            (mapping, connection_pool,),
-                            error_callback=self.error_callback))
+                            (mapping, connection_pool,)))
                 try:
                     for result in result_list:
-                        result.wait()
+                        result.get()
                 except KeyboardInterrupt:
                     pass
-                finally:
-                    self.save_chunk_dict()
 
     def save_chunk_dict(self, r=None):
         with self.lock:
@@ -399,11 +389,6 @@ class DepotDownloader:
             json.dump(dict(self.chunk_dict), self.chunk_dict_f)
             #self.chunk_dict_f.truncate()
             self.chunk_dict_f.flush()
-
-    def error_callback(self, e):
-        self.log.error(''.join(traceback.TracebackException.from_exception(e).format()))
-        sys.exit(1)
-
 
 def get_manifest_path_depot_key_dict(path):
     path = Path(path)
@@ -462,9 +447,12 @@ def main(new_args=None):
     if manifest_path_depot_key_dict:
         for manifest_path, depot_key in manifest_path_depot_key_dict.items():
             if manifest_path and depot_key:
-                d = DepotDownloader(manifest_path, depot_key, args.thread_num, save_path, server_set, level,
-                                    args.retry_num, args.login_anonymous, 20, args.appid, args.file_open_num)
-                d.download()
+                try:
+                    d = DepotDownloader(manifest_path, depot_key, args.thread_num, save_path, server_set, level,
+                                        args.retry_num, args.login_anonymous, 20, args.appid, args.file_open_num)
+                    d.download()
+                except Exception as e:
+                    raise SystemExit(1) from e
 
 if __name__ == '__main__':
     main()
