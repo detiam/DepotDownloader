@@ -14,11 +14,9 @@ from pathlib import Path
 from binascii import crc32
 from zipfile import ZipFile
 from collections import deque
-from gevent.lock import Semaphore
-from urllib.parse import urlparse
+from urllib3.util import parse_url
 from requests.adapters import HTTPAdapter
-from multiprocessing.pool import AsyncResult, ThreadPool
-from multiprocessing.dummy import Lock
+from multiprocessing.dummy import Pool, Lock
 
 from steam.utils.web import make_requests_session, APIHost, DEFAULT_PARAMS
 
@@ -82,7 +80,7 @@ class FileDownload:
         self.log = self.depot_downloader.log
         self.filepath = self.filemapping.filename.replace('\\', '/')
         self.path = self.depot_downloader.save_path / self.filepath
-        self.lock = Semaphore(1)
+        self.lock = Lock()
 
         if filemapping.flags != 64:
             if not self.path.exists():
@@ -105,18 +103,18 @@ class FileDownload:
     def download_chunk_and_save(self, chunk, max_attempts=5):
         chunk_id = chunk.sha.hex()
         data = self.get_chunk(chunk_id, max_attempts)
-        with self.lock:
-            while True:
-                try:                
+        while True:
+            try:
+                with self.lock:
                     self.path_f.seek(chunk.offset, 0)
                     self.path_f.write(data)
-                    break
-                except Exception:
-                    if not self.path_f:
-                        self.log.error('Need open file first')
-                        sys.exit(1)
-                    self.log.warning(f'Save chunk {chunk_id} to {self.filepath} failed, retry...')
-                    pass
+                break
+            except Exception:
+                if not self.path_f:
+                    self.log.error('Need open file first')
+                    sys.exit(1)
+                self.log.warning(f'Save chunk {chunk_id} to {self.filepath} failed, retry...')
+                pass
         self.chunk_dict[self.filepath].append(f'{chunk.offset}_{chunk.sha.hex()}')
         self.tqdm.set_postfix(filename=self.filepath[-(shutil.get_terminal_size().columns // 4):])
         self.tqdm.update(chunk.cb_original)
@@ -159,13 +157,12 @@ class FileDownload:
                              self.path, chunk_id, attempt+1, max_attempts, exp)
 
                 if attempt == max_attempts - 1:
+                    self.log.error(f"Failed to download chunk {chunk_id} after {max_attempts} attempts")
                     raise
 
             # Get a new server for the next attempt
             time.sleep(1)  # Add a delay before retrying
             server, token = self.depot_downloader.get_content_server(rotate=True)
-
-        raise SteamError(f"Failed to download chunk {chunk_id} after {max_attempts} attempts")
 
 
 class SingletonSteamClient(SteamClient):
@@ -180,7 +177,7 @@ class SingletonSteamClient(SteamClient):
     def __init__(self):
         if not self._initialized:
             self._initialized = True
-            self._lock = Semaphore(1)
+            self._lock = Lock()
             super().__init__()
             if args.use_websocket:
                 self.connection = WebsocketConnection()
@@ -189,7 +186,7 @@ class SingletonSteamClient(SteamClient):
                 raise SteamError(f'Login failure reason: {result.__repr__()}')
 
 
-class SafeDict(dict):
+class SingletonDict(dict):
     _instance = None
     _initialized = False
 
@@ -201,7 +198,7 @@ class SafeDict(dict):
     def __init__(self, *args, **kwargs):
         if not self._initialized:
             self._initialized = True
-            self._lock = Semaphore(1)
+            self._lock = Lock()
             super().__init__(*args, **kwargs)
 
     def __getitem__(self, key):
@@ -237,7 +234,7 @@ class SingletonDeque(deque):
     def __init__(self, *args, **kwargs):
         if not self._initialized:
             self._initialized = True
-            self._lock = Semaphore(1)
+            self._lock = Lock()
             super().__init__(*args, **kwargs)
 
     def append(self, item):
@@ -285,31 +282,15 @@ class SingletonDeque(deque):
             return super().__reversed__()
 
 
-class SingletonSemaphore(Semaphore):
-    _instance = None
-    _initialized = False
-
-    def __new__(cls, *args, **kwargs):
-        if not cls._instance:
-            cls._instance = super().__new__(cls, *args, **kwargs)
-        return cls._instance
-
-    def __init__(self, *args, **kwargs):
-        if not self._initialized:
-            self._initialized = True
-            super().__init__(*args, **kwargs)
-
-
 class DepotDownloader:
     def __init__(self, manifest_path, depot_key, thread_num=32, save_path=None, servers=None,
                  level=logging.INFO, retry_num=5, expect_logged_in=False, max_servers=20, appid=0,
                  file_open_num=32):
-        self.lock = SingletonSemaphore(1)
+        self.lock = Lock()
         self.expect_logged_in = expect_logged_in
         if expect_logged_in:
-            with self.lock:
-                self.client = SingletonSteamClient()
-                self.cdn = CDNClient(self.client)
+            self.client = SingletonSteamClient()
+            self.cdn = CDNClient(self.client)
         self.manifest_path = manifest_path
         self.depot_key = depot_key
         self.appid = appid
@@ -332,9 +313,9 @@ class DepotDownloader:
             self.chunk_dict_path.touch()
         self.chunk_dict_f = self.chunk_dict_path.open('r+', encoding='utf-8')
         try:
-            self.chunk_dict = SafeDict(json.load(self.chunk_dict_f))
+            self.chunk_dict = SingletonDict(json.load(self.chunk_dict_f))
         except json.decoder.JSONDecodeError:
-            self.chunk_dict = SafeDict()
+            self.chunk_dict = SingletonDict()
         self.web = make_requests_session()
         adapters = HTTPAdapter(self.max_servers, self.thread_num, 0, True)
         self.web.mount('http://', adapters)
@@ -345,9 +326,8 @@ class DepotDownloader:
     def get_content_server(self, servers=None, rotate=False, cell_id=0):
         if servers:
             for server_str in map(str, servers):
-                with self.lock:
-                    if server_str not in self.servers:
-                        self.servers.append(server_str)
+                if server_str not in self.servers:
+                    self.servers.append(server_str)
 
         if not self.servers:
             try:
@@ -362,10 +342,9 @@ class DepotDownloader:
                 x['type'] == 'OpenCache' or x.get('steam_china_only', False)
             ), content_servers):
                 server_str = f"{'https' if server['https_support'] == 'mandatory' else 'http'}://{server['host']}"
-                with self.lock:
-                    if server_str not in self.servers:
-                        self.servers.append(server_str)
-                        self.log.info('Appended server: ' + server_str)
+                if server_str not in self.servers:
+                    self.servers.append(server_str)
+                    self.log.info('Appended server: ' + server_str)
 
         if not self.servers:
             raise SteamError("Failed to fetch content servers")
@@ -375,11 +354,11 @@ class DepotDownloader:
 
         server_str = str(self.servers[0])
         if self.expect_logged_in:
-            return server_str, self.cdn.get_cdn_auth_token(self.appid, self.depot_id, urlparse(server_str).hostname)
+            return server_str, self.cdn.get_cdn_auth_token(self.appid, self.depot_id, parse_url(server_str).host)
         else:
             return server_str, ''
 
-    def download_file(self, filemapping, pool:ThreadPool):
+    def download_file(self, filemapping, pool):
         filemapping.chunks.sort(key=lambda x: x.offset)
         d = FileDownload(self, filemapping)
         result_list = []
@@ -394,12 +373,11 @@ class DepotDownloader:
             else:
                 self.tqdm.update(chunk.cb_original)
         for result in result_list:
-            result:AsyncResult
             result.wait()
 
     def download(self):
-        with ThreadPool(self.thread_num) as connection_pool:
-            with ThreadPool(self.file_open_num) as file_pool:
+        with Pool(self.thread_num) as connection_pool:
+            with Pool(self.file_open_num) as file_pool:
                 result_list = []
                 for mapping in self.manifest.payload.mappings:
                     result_list.append(
@@ -409,7 +387,6 @@ class DepotDownloader:
                             error_callback=self.error_callback))
                 try:
                     for result in result_list:
-                        result:AsyncResult
                         result.wait()
                 except KeyboardInterrupt:
                     pass
@@ -417,10 +394,11 @@ class DepotDownloader:
                     self.save_chunk_dict()
 
     def save_chunk_dict(self, r=None):
-        self.chunk_dict_f.seek(0)
-        json.dump(dict(self.chunk_dict), self.chunk_dict_f)
-        self.chunk_dict_f.truncate()
-        #self.chunk_dict_f.flush()
+        with self.lock:
+            self.chunk_dict_f.seek(0)
+            json.dump(dict(self.chunk_dict), self.chunk_dict_f)
+            #self.chunk_dict_f.truncate()
+            self.chunk_dict_f.flush()
 
     def error_callback(self, e):
         self.log.error(''.join(traceback.TracebackException.from_exception(e).format()))
