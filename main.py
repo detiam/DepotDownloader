@@ -13,9 +13,10 @@ from pathlib import Path
 from binascii import crc32
 from zipfile import ZipFile
 from collections import deque
+from gevent.lock import Semaphore
 from urllib3.util import parse_url
 from requests.adapters import HTTPAdapter
-from multiprocessing.dummy import Pool, Lock
+from multiprocessing.pool import ThreadPool
 
 from steam.utils.web import make_requests_session, APIHost, DEFAULT_PARAMS
 
@@ -79,7 +80,7 @@ class FileDownload:
         self.log = self.depot_downloader.log
         self.filepath = self.filemapping.filename.replace('\\', '/')
         self.path = self.depot_downloader.save_path / self.filepath
-        self.lock = Lock()
+        self.lock = Semaphore(1)
 
         if filemapping.flags != 64:
             if not self.path.exists():
@@ -169,7 +170,7 @@ class SingletonDict(dict):
     def __init__(self, *args, **kwargs):
         if not self._initialized:
             self._initialized = True
-            self._lock = Lock()
+            self._lock = Semaphore(1)
             super().__init__(*args, **kwargs)
 
     def __getitem__(self, key):
@@ -205,7 +206,7 @@ class SingletonDeque(deque):
     def __init__(self, *args, **kwargs):
         if not self._initialized:
             self._initialized = True
-            self._lock = Lock()
+            self._lock = Semaphore(1)
             super().__init__(*args, **kwargs)
 
     def append(self, item):
@@ -283,7 +284,7 @@ class DepotDownloader:
     def __init__(self, manifest_path, depot_key, thread_num=32, save_path=None, servers=None,
                  level=logging.INFO, retry_num=5, expect_logged_in=False, max_servers=20, appid=0,
                  file_open_num=32, use_websocket=False):
-        self.lock = Lock()
+        self.lock = Semaphore(1)
         self.expect_logged_in = expect_logged_in
         if expect_logged_in:
             self.client = SteamClient()
@@ -398,8 +399,8 @@ class DepotDownloader:
             pass
 
     def download(self):
-        with Pool(self.thread_num) as connection_pool:
-            with Pool(self.file_open_num) as file_pool:
+        with ThreadPool(self.thread_num) as connection_pool:
+            with ThreadPool(self.file_open_num) as file_pool:
                 result_list = []
                 for mapping in self.manifest.payload.mappings:
                     result_list.append(
