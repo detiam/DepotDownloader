@@ -1,3 +1,4 @@
+import sys
 import vdf
 import time
 import lzma
@@ -273,6 +274,32 @@ class SingletonDeque(deque):
             return super().__reversed__()
 
 
+class ExitController:
+    def __init__(self):
+        self.exit_flag = False
+        def _handle_interrupt(signum=None, frame=None):
+            self.exit_flag = True
+
+        if sys.platform == 'win32':
+            from win32api import SetConsoleCtrlHandler
+            from win32con import CTRL_BREAK_EVENT
+            def _win_interrupt_handler(dwCtrlType):
+                if dwCtrlType != CTRL_BREAK_EVENT:
+                    _register()
+                    _handle_interrupt()
+                    return 1
+                return 0
+            def _register():
+                SetConsoleCtrlHandler(_win_interrupt_handler, 0)
+
+            SetConsoleCtrlHandler(_win_interrupt_handler, 1)
+        else:
+            import signal
+            signal.signal(signal.SIGINT, _handle_interrupt)
+            signal.signal(signal.SIGHUP, _handle_interrupt)
+            signal.signal(signal.SIGTERM, _handle_interrupt)
+
+
 class DepotDownloader:
     def __init__(self, manifest_path, depot_key, thread_num=32, save_path=None, servers=None,
                  level=logging.INFO, retry_num=5, expect_logged_in=False, max_servers=20, appid=0,
@@ -307,6 +334,7 @@ class DepotDownloader:
             self.chunk_dict = SingletonDict(json.load(self.chunk_dict_f))
         except json.decoder.JSONDecodeError:
             self.chunk_dict = SingletonDict()
+        self.controller = ExitController()
         self.web = make_requests_session()
         adapters = HTTPAdapter(self.max_servers, self.thread_num, 0, True)
         self.web.mount('http://', adapters)
@@ -365,6 +393,8 @@ class DepotDownloader:
         try:
             for result in result_list:
                 result.get()
+                if self.controller.exit_flag:
+                    break
         except KeyboardInterrupt:
             pass
 
@@ -380,6 +410,8 @@ class DepotDownloader:
                 try:
                     for result in result_list:
                         result.get()
+                        if self.controller.exit_flag:
+                            break
                 except KeyboardInterrupt:
                     pass
 
