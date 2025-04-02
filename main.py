@@ -157,27 +157,6 @@ class FileDownload:
             server, token = self.depot_downloader.get_content_server(rotate=True)
 
 
-class SingletonSteamClient(SteamClient):
-    _instance = None
-    _initialized = False
-
-    def __new__(cls, *args, **kwargs):
-        if not cls._instance:
-            cls._instance = super().__new__(cls, *args, **kwargs)
-        return cls._instance
-
-    def __init__(self):
-        if not self._initialized:
-            self._initialized = True
-            self._lock = Lock()
-            super().__init__()
-            if args.use_websocket:
-                self.connection = WebsocketConnection()
-            result = self.anonymous_login()
-            if result != EResult.OK:
-                raise SteamError(f'Login failure reason: {result.__repr__()}')
-
-
 class SingletonDict(dict):
     _instance = None
     _initialized = False
@@ -303,11 +282,16 @@ class ExitController:
 class DepotDownloader:
     def __init__(self, manifest_path, depot_key, thread_num=32, save_path=None, servers=None,
                  level=logging.INFO, retry_num=5, expect_logged_in=False, max_servers=20, appid=0,
-                 file_open_num=32):
+                 file_open_num=32, use_websocket=False):
         self.lock = Lock()
         self.expect_logged_in = expect_logged_in
         if expect_logged_in:
-            self.client = SingletonSteamClient()
+            self.client = SteamClient()
+            if use_websocket:
+                self.client.connection = WebsocketConnection()
+            result = self.client.anonymous_login()
+            if result != EResult.OK:
+                raise SteamError(f'Login failure reason: {result.__repr__()}')
             self.cdn = CDNClient(self.client)
         self.manifest_path = manifest_path
         self.depot_key = depot_key
@@ -327,9 +311,10 @@ class DepotDownloader:
         self.get_content_server(servers)
         self.chunk_dict_path = self._get_chunk_saves()
         self.save_path = Path(save_path) if save_path else Path(str(self.depot_id))
-        self.chunk_dict_f = self.chunk_dict_path.open('r+', encoding='utf-8')
         try:
-            self.chunk_dict = SingletonDict(json.load(self.chunk_dict_f))
+            with self.lock:
+                with self.chunk_dict_path.open(encoding='utf-8') as f:
+                    self.chunk_dict = SingletonDict(json.load(f))
         except json.decoder.JSONDecodeError:
             self.chunk_dict = SingletonDict()
         self.controller = ExitController()
@@ -337,7 +322,7 @@ class DepotDownloader:
         adapters = HTTPAdapter(self.max_servers, self.thread_num, 0, True)
         self.web.mount('http://', adapters)
         self.web.mount('https://', adapters)
-        self.tqdm = tqdm(total=self.manifest.metadata.cb_disk_original, unit='B', unit_scale=True)
+        self.tqdm = tqdm(total=self.manifest.metadata.cb_disk_original, unit='B', unit_scale=True, leave=False)
         self.tqdm.set_description_str(f'Depot {self.depot_id}')
 
     def _get_chunk_saves(self):
@@ -407,6 +392,7 @@ class DepotDownloader:
             for result in result_list:
                 result.get()
                 if self.controller.exit_flag:
+                    self.tqdm.close()
                     break
         except KeyboardInterrupt:
             pass
@@ -424,25 +410,25 @@ class DepotDownloader:
                     for result in result_list:
                         result.get()
                         if self.controller.exit_flag:
-                            break
+                            connection_pool.terminate()
+                            return
                 except KeyboardInterrupt:
                     pass
 
     def save_chunk_dict(self, r=None):
-        with self.lock:
-            self.chunk_dict_f.seek(0)
-            json.dump(dict(self.chunk_dict), self.chunk_dict_f)
-            #self.chunk_dict_f.truncate()
+        if self.lock.acquire(blocking=False):
+            try:
+                with self.chunk_dict_path.open('r+', encoding='utf-8') as f:
+                    json.dump(dict(self.chunk_dict), f)
 
-            percentage = int(self.tqdm.n / self.tqdm.total * 100)
-            name = self.chunk_dict_path.with_name(f'{percentage}% - {self.depot_id}.json')
-            if self.chunk_dict_path != name:
-                self.chunk_dict_path = self.chunk_dict_path.rename(name)
-                self.chunk_dict_f.close()
-                self.chunk_dict_f = self.chunk_dict_path.open('r+', encoding='utf-8')
-            else:
-                self.chunk_dict_f.flush()
-                
+                percentage = round(self.tqdm.n / self.tqdm.total * 100, 1)
+                name = self.chunk_dict_path.with_name(f'{percentage}% - {self.depot_id}.json')
+                if self.chunk_dict_path != name:
+                    self.chunk_dict_path = self.chunk_dict_path.rename(name)
+            finally:
+                self.lock.release()
+        else:
+            return
 
 def get_manifest_path_depot_key_dict(path):
     path = Path(path)
@@ -502,7 +488,8 @@ def main(new_args=None):
         for manifest_path, depot_key in manifest_path_depot_key_dict.items():
             if manifest_path and depot_key:
                 d = DepotDownloader(manifest_path, depot_key, args.thread_num, save_path, server_set, level,
-                                    args.retry_num, args.login_anonymous, 20, args.appid, args.file_open_num)
+                                    args.retry_num, args.login_anonymous, 20, args.appid, args.file_open_num,
+                                    args.use_websocket)
                 d.download()
 
 if __name__ == '__main__':
