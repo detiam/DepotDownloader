@@ -447,12 +447,9 @@ def main(new_args=None):
     if manifest_path_depot_key_dict:
         for manifest_path, depot_key in manifest_path_depot_key_dict.items():
             if manifest_path and depot_key:
-                try:
-                    d = DepotDownloader(manifest_path, depot_key, args.thread_num, save_path, server_set, level,
-                                        args.retry_num, args.login_anonymous, 20, args.appid, args.file_open_num)
-                    d.download()
-                except Exception as e:
-                    raise SystemExit(1) from e
+                d = DepotDownloader(manifest_path, depot_key, args.thread_num, save_path, server_set, level,
+                                    args.retry_num, args.login_anonymous, 20, args.appid, args.file_open_num)
+                d.download()
 
 if __name__ == '__main__':
     main()
