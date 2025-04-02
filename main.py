@@ -17,7 +17,7 @@ from collections import deque
 from gevent.lock import Semaphore
 from urllib.parse import urlparse
 from requests.adapters import HTTPAdapter
-from multiprocessing.pool import ThreadPool
+from multiprocessing.pool import AsyncResult, ThreadPool
 from multiprocessing.dummy import Lock
 
 from steam.utils.web import make_requests_session, APIHost, DEFAULT_PARAMS
@@ -34,7 +34,7 @@ parser.add_argument('-a', '--apihost', type=str, default='Public',
                     help=f'available: {APIHost._member_names_} or a custom string')
 parser.add_argument('-i', '--appid', type=int, default=0)
 parser.add_argument('-l', '--level', type=str, default='INFO')
-parser.add_argument('-r', '--retry-num', type=int, default=3)
+parser.add_argument('-r', '--retry-num', type=int, default=5)
 parser.add_argument('--use-http', action='store_true')
 parser.add_argument('--use-websocket', action='store_true')
 
@@ -82,7 +82,7 @@ class FileDownload:
         self.log = self.depot_downloader.log
         self.filepath = self.filemapping.filename.replace('\\', '/')
         self.path = self.depot_downloader.save_path / self.filepath
-        self.lock = Lock()
+        self.lock = Semaphore(1)
 
         if filemapping.flags != 64:
             if not self.path.exists():
@@ -102,9 +102,9 @@ class FileDownload:
 
     #def download_file():
 
-    def download_chunk_and_save(self, chunk):
+    def download_chunk_and_save(self, chunk, max_attempts=5):
         chunk_id = chunk.sha.hex()
-        data = self.get_chunk(chunk_id)
+        data = self.get_chunk(chunk_id, max_attempts)
         with self.lock:
             while True:
                 try:                
@@ -201,7 +201,7 @@ class SafeDict(dict):
     def __init__(self, *args, **kwargs):
         if not self._initialized:
             self._initialized = True
-            self._lock = Lock()
+            self._lock = Semaphore(1)
             super().__init__(*args, **kwargs)
 
     def __getitem__(self, key):
@@ -302,7 +302,7 @@ class SingletonSemaphore(Semaphore):
 
 class DepotDownloader:
     def __init__(self, manifest_path, depot_key, thread_num=32, save_path=None, servers=None,
-                 level=logging.INFO, retry_num=3, expect_logged_in=False, max_servers=20, appid=0,
+                 level=logging.INFO, retry_num=5, expect_logged_in=False, max_servers=20, appid=0,
                  file_open_num=32):
         self.lock = SingletonSemaphore(1)
         self.expect_logged_in = expect_logged_in
@@ -313,6 +313,7 @@ class DepotDownloader:
         self.manifest_path = manifest_path
         self.depot_key = depot_key
         self.appid = appid
+        self.retry_num = retry_num
         self.thread_num = int(thread_num)
         self.file_open_num = int(file_open_num)
         self.max_servers = int(max_servers)
@@ -327,18 +328,15 @@ class DepotDownloader:
         self.get_content_server(servers)
         self.chunk_dict_path = Path(f'{self.depot_id}.json')
         self.save_path = Path(save_path) if save_path else Path(str(self.depot_id))
-        self.chunk_dict = SafeDict()
-        if self.chunk_dict_path.exists():
-            with self.chunk_dict_path.open(encoding='utf-8') as f:
-                self.chunk_dict = SafeDict(json.load(f))
-        else:
+        if not self.chunk_dict_path.exists():
             self.chunk_dict_path.touch()
-            with self.lock:
-                with self.chunk_dict_path.open('w', encoding='utf-8') as f:
-                        json.dump(self.chunk_dict, f)
-        self.chunk_dict_f = self.chunk_dict_path.open('w', encoding='utf-8')
+        self.chunk_dict_f = self.chunk_dict_path.open('r+', encoding='utf-8')
+        try:
+            self.chunk_dict = SafeDict(json.load(self.chunk_dict_f))
+        except json.decoder.JSONDecodeError:
+            self.chunk_dict = SafeDict()
         self.web = make_requests_session()
-        adapters = HTTPAdapter(max_retries=retry_num, pool_connections=self.max_servers, pool_maxsize=self.thread_num, pool_block=True)
+        adapters = HTTPAdapter(self.max_servers, self.thread_num, 0, True)
         self.web.mount('http://', adapters)
         self.web.mount('https://', adapters)
         self.tqdm = tqdm(total=self.manifest.metadata.cb_disk_original, unit='B', unit_scale=True)
@@ -385,38 +383,44 @@ class DepotDownloader:
         filemapping.chunks.sort(key=lambda x: x.offset)
         d = FileDownload(self, filemapping)
         result_list = []
-        def savec(r):
-            self.save_chunk_dict()
         for chunk in filemapping.chunks:
             if f'{chunk.offset}_{chunk.sha.hex()}' not in self.chunk_dict[d.filepath]:
                 result_list.append(
-                    pool.apply_async(d.download_chunk_and_save, (chunk,), callback=savec, error_callback=self.error_callback))
+                    pool.apply_async(
+                        d.download_chunk_and_save,
+                        (chunk, self.retry_num,),
+                        callback=self.save_chunk_dict,
+                        error_callback=self.error_callback))
             else:
                 self.tqdm.update(chunk.cb_original)
         for result in result_list:
+            result:AsyncResult
             result.wait()
 
     def download(self):
         with ThreadPool(self.thread_num) as connection_pool:
-            with ThreadPool( # connection_pool should bigger than file_pool
-                self.file_open_num if self.thread_num >= self.file_open_num else self.thread_num) as file_pool:
+            with ThreadPool(self.file_open_num) as file_pool:
+                result_list = []
                 for mapping in self.manifest.payload.mappings:
-                    file_pool.apply_async(
-                        self.download_file,
-                        (mapping, connection_pool,),
-                        error_callback=self.error_callback)
+                    result_list.append(
+                        file_pool.apply_async(
+                            self.download_file,
+                            (mapping, connection_pool,),
+                            error_callback=self.error_callback))
                 try:
-                    file_pool.close()
-                    file_pool.join()
+                    for result in result_list:
+                        result:AsyncResult
+                        result.wait()
                 except KeyboardInterrupt:
                     pass
                 finally:
                     self.save_chunk_dict()
 
-    def save_chunk_dict(self):
+    def save_chunk_dict(self, r=None):
         self.chunk_dict_f.seek(0)
         json.dump(dict(self.chunk_dict), self.chunk_dict_f)
-        self.chunk_dict_f.flush()
+        self.chunk_dict_f.truncate()
+        #self.chunk_dict_f.flush()
 
     def error_callback(self, e):
         self.log.error(''.join(traceback.TracebackException.from_exception(e).format()))
