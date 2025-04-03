@@ -31,6 +31,7 @@ parser.add_argument('-s', '--server', type=str, dest='server_list', action='appe
 parser.add_argument('-a', '--apihost', type=str, default='Public',
                     help=f'available: {APIHost._member_names_} or a custom string')
 parser.add_argument('-i', '--appid', type=int, default=0)
+parser.add_argument('-e', '--cellid', type=int, default=0)
 parser.add_argument('-l', '--level', type=str, default='INFO')
 parser.add_argument('-r', '--retry-num', type=int, default=5)
 parser.add_argument('--use-http', action='store_true')
@@ -283,7 +284,7 @@ class ExitController:
 class DepotDownloader:
     def __init__(self, manifest_path, depot_key, thread_num=32, save_path=None, servers=None,
                  level=logging.INFO, retry_num=5, expect_logged_in=False, max_servers=20, appid=0,
-                 file_open_num=32, use_websocket=False):
+                 file_open_num=32, use_websocket=False, cellid=0):
         self.lock = Semaphore(1)
         self.expect_logged_in = expect_logged_in
         if expect_logged_in:
@@ -297,6 +298,7 @@ class DepotDownloader:
         self.manifest_path = manifest_path
         self.depot_key = depot_key
         self.appid = appid
+        self.cellid = cellid
         self.retry_num = retry_num
         self.thread_num = int(thread_num)
         self.file_open_num = int(file_open_num)
@@ -350,7 +352,7 @@ class DepotDownloader:
         if not self.servers:
             try:
                 resp = webapi_get('IContentServerDirectoryService', 'GetServersForSteamPipe',
-                                  params={'cell_id': cell_id, 'max_servers': self.max_servers})
+                                  params={'cell_id': cell_id or self.cellid, 'max_servers': self.max_servers})
                 content_servers = resp['response']['servers']
                 content_servers.sort(key=lambda x: (x['type'] != 'CDN', x['priority_class']))
             except Exception:
@@ -490,7 +492,7 @@ def main(new_args=None):
             if manifest_path and depot_key:
                 d = DepotDownloader(manifest_path, depot_key, args.thread_num, save_path, server_set, level,
                                     args.retry_num, args.login_anonymous, 20, args.appid, args.file_open_num,
-                                    args.use_websocket)
+                                    args.use_websocket, args.cellid)
                 d.download()
 
 if __name__ == '__main__':
