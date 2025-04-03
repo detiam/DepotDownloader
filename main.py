@@ -265,27 +265,37 @@ class SingletonDeque(deque):
 class ExitController:
     def __init__(self):
         self.exit_flag = False
-        def _handle_interrupt(signum=None, frame=None):
-            self.exit_flag = True
 
         if sys.platform == 'win32':
             from win32api import SetConsoleCtrlHandler
             from win32con import CTRL_BREAK_EVENT
             def _win_interrupt_handler(dwCtrlType):
                 if dwCtrlType != CTRL_BREAK_EVENT:
-                    _register()
-                    _handle_interrupt()
+                    _unregister()
+                    self.exit_flag = True
                     return 1
                 return 0
-            def _register():
+            def _unregister():
                 SetConsoleCtrlHandler(_win_interrupt_handler, 0)
 
             SetConsoleCtrlHandler(_win_interrupt_handler, 1)
         else:
             import signal
+            import atexit
+            import termios
+            def _handle_interrupt(signum=None, frame=None):
+                self.exit_flag = True
             signal.signal(signal.SIGINT, _handle_interrupt)
             signal.signal(signal.SIGHUP, _handle_interrupt)
             signal.signal(signal.SIGTERM, _handle_interrupt)
+            fd = sys.stdin.fileno()
+            original_settings = termios.tcgetattr(fd)
+            new_settings = termios.tcgetattr(fd)
+            new_settings[3] &= ~termios.ECHOCTL
+            termios.tcsetattr(fd, termios.TCSANOW, new_settings)
+            def restore_terminal():
+                termios.tcsetattr(fd, termios.TCSANOW, original_settings)
+            atexit.register(restore_terminal)
 
 
 class DepotDownloader:
@@ -417,7 +427,6 @@ class DepotDownloader:
             for result in result_list:
                 result.get()
                 if self.controller.exit_flag:
-                    self.tqdm.close()
                     break
         except KeyboardInterrupt:
             pass
@@ -436,6 +445,7 @@ class DepotDownloader:
                         result.get()
                         if self.controller.exit_flag:
                             connection_pool.terminate()
+                            file_pool.terminate()
                             break
                 except KeyboardInterrupt:
                     pass
