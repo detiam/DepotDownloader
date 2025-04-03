@@ -144,6 +144,9 @@ class FileDownload:
                             data = zf.read(zf.filelist[0])
 
                     return data
+                elif resp.status_code == 403:
+                    # token missing maybe?
+                    raise SteamError(f'{server}: {resp}')
                 elif 400 <= resp.status_code < 500:
                     raise SteamError("%s %s HTTP Error %s" % (self.path, chunk_id, resp.status_code))
             except Exception as exp:
@@ -225,6 +228,10 @@ class SingletonDeque(deque):
     def popleft(self):
         with self._lock:
             return super().popleft()
+
+    def remove(self):
+        with self._lock:
+            return super().remove()
 
     def __len__(self):
         with self._lock:
@@ -310,8 +317,6 @@ class DepotDownloader:
             content = f.read()
         self.manifest = DepotManifest(content)
         self.depot_id = self.manifest.depot_id
-        self.servers = SingletonDeque()
-        self.get_content_server(servers)
         self.chunk_dict_path = self._get_chunk_saves()
         self.save_path = Path(save_path) if save_path else Path(str(self.depot_id))
         try:
@@ -322,9 +327,13 @@ class DepotDownloader:
             self.chunk_dict = SingletonDict()
         self.controller = ExitController()
         self.web = make_requests_session()
+        self.web.headers['Cache-Control'] = 'no-cache'
         adapters = HTTPAdapter(self.max_servers, self.thread_num, 0, True)
         self.web.mount('http://', adapters)
         self.web.mount('https://', adapters)
+        self.servers = SingletonDeque()
+        self.num_entries_in_client_list = 0 # num of how many cdn auth token server can be used
+        self.get_content_server(servers, fetch_all_cdn_token=True)
         self.tqdm = tqdm(total=self.manifest.metadata.cb_disk_original, unit='B', unit_scale=True, leave=False)
         self.tqdm.set_description_str(f'Depot {self.depot_id}')
 
@@ -343,7 +352,7 @@ class DepotDownloader:
 
         return chunk_saves
 
-    def get_content_server(self, servers=None, rotate=False, cell_id=0):
+    def get_content_server(self, servers=None, rotate=False, cell_id=0, fetch_all_cdn_token=False):
         if servers:
             for server_str in map(str, servers):
                 if server_str not in self.servers:
@@ -362,6 +371,8 @@ class DepotDownloader:
                 x['type'] == 'OpenCache' or x.get('steam_china_only', False)
             ), content_servers):
                 server_str = f"{'https' if server['https_support'] == 'mandatory' else 'http'}://{server['host']}"
+                if not self.num_entries_in_client_list:
+                    self.num_entries_in_client_list = server.get('num_entries_in_client_list', 0)
                 if server_str not in self.servers:
                     self.servers.append(server_str)
                     self.log.info('Appended server: ' + server_str)
@@ -372,11 +383,22 @@ class DepotDownloader:
         if rotate:
             self.servers.rotate(-1)
 
-        server_str = str(self.servers[0])
+        server_str, token = self.servers[0], ''
         if self.expect_logged_in:
-            return server_str, self.cdn.get_cdn_auth_token(self.appid, self.depot_id, parse_url(server_str).host)
-        else:
-            return server_str, ''
+            if fetch_all_cdn_token:
+                for server in self.servers:
+                    self.cdn.get_cdn_auth_token(self.appid, self.depot_id, parse_url(server).host)
+            while True:
+                result:dict = self.cdn.get_cdn_auth_token(self.appid, self.depot_id, parse_url(server_str).host)
+                if result['eresult'] in (EResult.OK, EResult.Fail): # Fail means token unneeded seems
+                    token = result['token']
+                    break
+                else:
+                    self.servers.remove(server_str)
+                    self.log.info(f'Removed server: {server_str} because error code {result['eresult']} when try to get cdn auth token.')
+                    server_str = self.servers[0]
+
+        return server_str, token
 
     def download_file(self, filemapping, pool):
         filemapping.chunks.sort(key=lambda x: x.offset)
@@ -414,7 +436,7 @@ class DepotDownloader:
                         result.get()
                         if self.controller.exit_flag:
                             connection_pool.terminate()
-                            return
+                            break
                 except KeyboardInterrupt:
                     pass
 
