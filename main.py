@@ -326,6 +326,7 @@ class DepotDownloader:
         with open(self.manifest_path, 'rb') as f:
             content = f.read()
         self.manifest = DepotManifest(content)
+        self.manifest.decrypt_filenames(depot_key)
         self.depot_id = self.manifest.depot_id
         self.chunk_dict_path = self._get_chunk_saves()
         self.save_path = Path(save_path) if save_path else Path(str(self.depot_id))
