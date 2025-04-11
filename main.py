@@ -79,21 +79,21 @@ class FileDownload:
         self.depot_id = self.depot_downloader.depot_id
         self.depot_key = self.depot_downloader.depot_key
         self.log = self.depot_downloader.log
-        self.filepath = self.filemapping.filename.replace('\\', '/')
+        self.filepath = Path(self.filemapping.filename)
         self.path = self.depot_downloader.save_path / self.filepath
         self.lock = Semaphore(1)
 
         if filemapping.flags != 64:
             if not self.path.exists():
-                if self.filepath in self.chunk_dict:
-                    self.chunk_dict[self.filepath] = []
+                if self.filepath.as_posix() in self.chunk_dict:
+                    self.chunk_dict[self.filepath.as_posix()] = []
                 if not self.path.parent.exists():
                     self.path.parent.mkdir(parents=True, exist_ok=True)
                 if not self.path.exists():
                     self.path.touch(exist_ok=True)
             self.path_f = self.path.open('rb+')
-        if self.filepath not in self.chunk_dict:
-            self.chunk_dict[self.filepath] = []
+        if self.filepath.as_posix() not in self.chunk_dict:
+            self.chunk_dict[self.filepath.as_posix()] = []
 
     #def download_file():
 
@@ -109,8 +109,8 @@ class FileDownload:
             except Exception:
                 self.log.warning(f'Save chunk {chunk_id} to {self.filepath} failed, retry...')
                 pass
-        self.chunk_dict[self.filepath].append(f'{chunk.offset}_{chunk.sha.hex()}')
-        self.tqdm.set_postfix(filename=self.filepath[-(shutil.get_terminal_size().columns // 4):])
+        self.chunk_dict[self.filepath.as_posix()].append(f'{chunk.offset}_{chunk.sha.hex()}')
+        self.tqdm.set_postfix(filename=str(self.filepath)[-(shutil.get_terminal_size().columns // 4):])
         self.tqdm.update(chunk.cb_original)
 
     def get_chunk(self, chunk_id, max_attempts=5):
@@ -416,7 +416,7 @@ class DepotDownloader:
         d = FileDownload(self, filemapping)
         result_list = []
         for chunk in filemapping.chunks:
-            if f'{chunk.offset}_{chunk.sha.hex()}' not in self.chunk_dict[d.filepath]:
+            if f'{chunk.offset}_{chunk.sha.hex()}' not in self.chunk_dict[d.filepath.as_posix()]:
                 result_list.append(
                     pool.apply_async(
                         d.download_chunk_and_save,
