@@ -79,7 +79,7 @@ class FileDownload:
         self.depot_id = self.depot_downloader.depot_id
         self.depot_key = self.depot_downloader.depot_key
         self.log = self.depot_downloader.log
-        self.filepath = Path(self.filemapping.filename)
+        self.filepath = Path(self.filemapping.filename.replace('\\', '/'))
         self.path = self.depot_downloader.save_path / self.filepath
         self.lock = Semaphore(1)
 
