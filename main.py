@@ -90,9 +90,8 @@ class FileDownload:
                 if not self.path.parent.exists():
                     self.path.parent.mkdir(parents=True, exist_ok=True)
                 if not self.path.exists():
-                    with open(self.path.as_posix(), "wb") as file:
+                    with self.path.open("wb") as file:
                         file.truncate(depotfile.size)
-            self.path_f = self.path.open('rb+')
         if self.filepath.as_posix() not in self.chunk_dict:
             self.chunk_dict[self.filepath.as_posix()] = []
 
@@ -103,9 +102,10 @@ class FileDownload:
         data = self.get_chunk(chunk_id, max_attempts)
         while True:
             try:
-                with self.lock:
-                    self.path_f.seek(chunk.offset, 0)
-                    self.path_f.write(data)
+                with self.path.open('rb+') as file:
+                    with self.lock:
+                        file.seek(chunk.offset, 0)
+                        file.write(data)
                 break
             except Exception:
                 self.log.warning(f'Save chunk {chunk_id} to {self.filepath} failed, retry...')
