@@ -10,7 +10,7 @@ import argparse
 from tqdm import tqdm
 from io import BytesIO
 from pathlib import Path
-from binascii import crc32
+from binascii import crc32, unhexlify
 from zipfile import ZipFile
 from collections import deque
 from gevent.lock import Semaphore
@@ -65,7 +65,7 @@ from steam.webapi import get as webapi_get
 from steam.client import SteamClient
 from steam.client.cdn import CDNClient
 from steam.core.connection import WebsocketConnection
-from steam.core.manifest import DepotManifest
+from steam.core.manifest import DepotManifest, DepotFile
 from steam.core.crypto import symmetric_decrypt
 
 
@@ -74,23 +74,26 @@ class FileDownload:
         self.depot_downloader = depot_downloader
         self.tqdm: tqdm = self.depot_downloader.tqdm
         self.manifest = self.depot_downloader.manifest
-        self.filemapping = filemapping
+        depotfile = DepotFile(self.manifest, filemapping)
         self.chunk_dict = self.depot_downloader.chunk_dict
         self.depot_id = self.depot_downloader.depot_id
         self.depot_key = self.depot_downloader.depot_key
         self.log = self.depot_downloader.log
-        self.filepath = Path(self.filemapping.filename.replace('\\', '/'))
-        self.path = self.depot_downloader.save_path / self.filepath
+        self.filepath = Path(depotfile.filename)
+        self.path:Path = self.depot_downloader.save_path / self.filepath
         self.lock = Semaphore(1)
 
-        if filemapping.flags != 64:
+        if not depotfile.is_directory:
             if not self.path.exists():
                 if self.filepath.as_posix() in self.chunk_dict:
                     self.chunk_dict[self.filepath.as_posix()] = []
                 if not self.path.parent.exists():
                     self.path.parent.mkdir(parents=True, exist_ok=True)
                 if not self.path.exists():
-                    self.path.touch(exist_ok=True)
+                    #self.path.touch(exist_ok=True)
+                    with open(self.path.as_posix(), "wb") as file:
+                        file.seek(depotfile.size - 1)
+                        file.write(b"\0")
             self.path_f = self.path.open('rb+')
         if self.filepath.as_posix() not in self.chunk_dict:
             self.chunk_dict[self.filepath.as_posix()] = []
@@ -122,7 +125,7 @@ class FileDownload:
                 resp = self.depot_downloader.web.get(url, timeout=10)
 
                 if resp.ok:
-                    data = symmetric_decrypt(resp.content, bytes.fromhex(self.depot_key))
+                    data = symmetric_decrypt(resp.content, self.depot_key)
 
                     if data[:2] == b'VZ':
                         if data[-2:] != b'zv':
@@ -313,7 +316,7 @@ class DepotDownloader:
                 raise SteamError(f'Login failure reason: {result.__repr__()}')
             self.cdn = CDNClient(self.client)
         self.manifest_path = manifest_path
-        self.depot_key = depot_key
+        self.depot_key = unhexlify(depot_key)
         self.appid = appid
         self.cellid = cellid
         self.retry_num = retry_num
@@ -326,7 +329,7 @@ class DepotDownloader:
         with open(self.manifest_path, 'rb') as f:
             content = f.read()
         self.manifest = DepotManifest(content)
-        self.manifest.decrypt_filenames(depot_key)
+        self.manifest.decrypt_filenames(self.depot_key)
         self.depot_id = self.manifest.depot_id
         self.chunk_dict_path = self._get_chunk_saves()
         self.save_path = Path(save_path) if save_path else Path(str(self.depot_id))
@@ -345,7 +348,7 @@ class DepotDownloader:
         self.servers = SingletonDeque()
         self.num_entries_in_client_list = 0 # num of how many cdn auth token server can be used
         self.get_content_server(servers, fetch_all_cdn_token=True)
-        self.tqdm = tqdm(total=self.manifest.metadata.cb_disk_original, unit='B', unit_scale=True, leave=False)
+        self.tqdm = tqdm(total=self.manifest.metadata.cb_disk_original, unit='B', unit_scale=True, leave=True)
         self.tqdm.set_description_str(f'Depot {self.depot_id}')
 
     def _get_chunk_saves(self):
