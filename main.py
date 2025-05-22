@@ -90,10 +90,8 @@ class FileDownload:
                 if not self.path.parent.exists():
                     self.path.parent.mkdir(parents=True, exist_ok=True)
                 if not self.path.exists():
-                    #self.path.touch(exist_ok=True)
                     with open(self.path.as_posix(), "wb") as file:
-                        file.seek(depotfile.size - 1)
-                        file.write(b"\0")
+                        file.truncate(depotfile.size)
             self.path_f = self.path.open('rb+')
         if self.filepath.as_posix() not in self.chunk_dict:
             self.chunk_dict[self.filepath.as_posix()] = []
