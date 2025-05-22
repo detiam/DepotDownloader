@@ -1,4 +1,5 @@
-import sys
+import os
+import threading
 import vdf
 import time
 import lzma
@@ -16,7 +17,6 @@ from collections import deque
 from gevent.lock import Semaphore
 from urllib3.util import parse_url
 from requests.adapters import HTTPAdapter
-from multiprocessing.pool import ThreadPool
 
 from steam.utils.web import make_requests_session, APIHost, DEFAULT_PARAMS
 
@@ -68,7 +68,7 @@ from steam.core.connection import WebsocketConnection
 from steam.core.manifest import DepotManifest, DepotFile
 from steam.core.crypto import symmetric_decrypt
 
-
+file_semaphore = threading.Semaphore(512)
 class FileDownload:
     def __init__(self, depot_downloader, filemapping):
         self.depot_downloader = depot_downloader
@@ -91,7 +91,10 @@ class FileDownload:
                     self.path.parent.mkdir(parents=True, exist_ok=True)
                 if not self.path.exists():
                     with self.path.open("wb") as file:
-                        file.truncate(depotfile.size)
+                        if hasattr(os, 'posix_fallocate'):
+                            os.posix_fallocate(file.fileno(), 0, depotfile.size)
+                        else:
+                            file.truncate(depotfile.size)
         if self.filepath.as_posix() not in self.chunk_dict:
             self.chunk_dict[self.filepath.as_posix()] = []
 
@@ -100,16 +103,10 @@ class FileDownload:
     def download_chunk_and_save(self, chunk, max_attempts=5):
         chunk_id = chunk.sha.hex()
         data = self.get_chunk(chunk_id, max_attempts)
-        while True:
-            try:
+        with file_semaphore, self.lock:
                 with self.path.open('rb+') as file:
-                    with self.lock:
-                        file.seek(chunk.offset, 0)
-                        file.write(data)
-                break
-            except Exception:
-                self.log.warning(f'Save chunk {chunk_id} to {self.filepath} failed, retry...')
-                pass
+                    file.seek(chunk.offset, 0)
+                    file.write(data)
         self.chunk_dict[self.filepath.as_posix()].append(f'{chunk.offset}_{chunk.sha.hex()}')
         self.tqdm.set_postfix(filename=str(self.filepath)[-(shutil.get_terminal_size().columns // 4):])
         self.tqdm.update(chunk.cb_original)
@@ -263,42 +260,6 @@ class SingletonDeque(deque):
             return super().__reversed__()
 
 
-class ExitController:
-    def __init__(self):
-        self.exit_flag = False
-
-        if sys.platform == 'win32':
-            from win32api import SetConsoleCtrlHandler
-            from win32con import CTRL_BREAK_EVENT
-            def _win_interrupt_handler(dwCtrlType):
-                if dwCtrlType != CTRL_BREAK_EVENT:
-                    _unregister()
-                    self.exit_flag = True
-                    return 1
-                return 0
-            def _unregister():
-                SetConsoleCtrlHandler(_win_interrupt_handler, 0)
-
-            SetConsoleCtrlHandler(_win_interrupt_handler, 1)
-        else:
-            import signal
-            import atexit
-            import termios
-            def _handle_interrupt(signum=None, frame=None):
-                self.exit_flag = True
-            signal.signal(signal.SIGINT, _handle_interrupt)
-            signal.signal(signal.SIGHUP, _handle_interrupt)
-            signal.signal(signal.SIGTERM, _handle_interrupt)
-            fd = sys.stdin.fileno()
-            original_settings = termios.tcgetattr(fd)
-            new_settings = termios.tcgetattr(fd)
-            new_settings[3] &= ~termios.ECHOCTL
-            termios.tcsetattr(fd, termios.TCSANOW, new_settings)
-            def restore_terminal():
-                termios.tcsetattr(fd, termios.TCSANOW, original_settings)
-            atexit.register(restore_terminal)
-
-
 class DepotDownloader:
     def __init__(self, manifest_path, depot_key, thread_num=32, save_path=None, servers=None,
                  level=logging.INFO, retry_num=5, expect_logged_in=False, max_servers=20, appid=0,
@@ -337,7 +298,6 @@ class DepotDownloader:
                     self.chunk_dict = SingletonDict(json.load(f))
         except json.decoder.JSONDecodeError:
             self.chunk_dict = SingletonDict()
-        self.controller = ExitController()
         self.web = make_requests_session()
         self.web.headers['Cache-Control'] = 'no-cache'
         adapters = HTTPAdapter(self.max_servers, self.thread_num, 0, True)
@@ -428,29 +388,33 @@ class DepotDownloader:
         try:
             for result in result_list:
                 result.get()
-                if self.controller.exit_flag:
-                    break
         except KeyboardInterrupt:
             pass
 
     def download(self):
-        with ThreadPool(self.thread_num) as connection_pool:
-            with ThreadPool(self.file_open_num) as file_pool:
-                result_list = []
-                for mapping in self.manifest.payload.mappings:
-                    result_list.append(
-                        file_pool.apply_async(
-                            self.download_file,
-                            (mapping, connection_pool,)))
-                try:
-                    for result in result_list:
-                        result.get()
-                        if self.controller.exit_flag:
-                            connection_pool.terminate()
-                            file_pool.terminate()
-                            break
-                except KeyboardInterrupt:
-                    pass
+        result_list = []
+        for file_mapping in self.manifest.payload.mappings:
+            file_mapping.chunks.sort(key=lambda x: x.offset)
+            file_downloader = FileDownload(self, file_mapping)
+            for chunk in file_mapping.chunks:
+                if f'{chunk.offset}_{chunk.sha.hex()}' not in self.chunk_dict[file_downloader.filepath.as_posix()]:
+                    #print(chunk.sha.hex())
+                    #file_downloader.download_chunk_and_save(chunk, self.retry_num)
+                    #greenlet = gevent.spawn(file_downloader.download_chunk_and_save, chunk, self.retry_num)
+                    #greenlet.start()
+                    #greenlet.add_spawn_callback(self.save_chunk_dict)
+                    #result_list.append(greenlet)
+                    t = threading.Thread(target=file_downloader.download_chunk_and_save, args=(chunk, self.retry_num,))
+                    result_list.append(t)
+                    t.start()
+                else:
+                    self.tqdm.update(chunk.cb_original)
+        for t in result_list:
+            t.join()
+        #try:
+            #gevent.joinall(result_list)
+        #except KeyboardInterrupt:
+        #    pass
 
     def save_chunk_dict(self, r=None):
         if self.lock.acquire(blocking=False):
