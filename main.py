@@ -17,13 +17,12 @@ from collections import deque
 from gevent.lock import Semaphore
 from urllib3.util import parse_url
 from requests.adapters import HTTPAdapter
+from concurrent.futures import ThreadPoolExecutor
 
 from steam.utils.web import make_requests_session, APIHost, DEFAULT_PARAMS
 
 parser = argparse.ArgumentParser(add_help=True)
 parser.add_argument('-t', '--thread-num', type=int, default=32)
-parser.add_argument('-f', '--file-open-num', type=int, default=32,
-                    help=f'the number of how many file can be write same time, should smaller than thread-num')
 parser.add_argument('-o', '--save-path', type=str)
 parser.add_argument('-c', '--login-anonymous', action='store_true',
                     help=f'login anonymously and enable request cdn auth token')
@@ -68,11 +67,9 @@ from steam.core.connection import WebsocketConnection
 from steam.core.manifest import DepotManifest, DepotFile
 from steam.core.crypto import symmetric_decrypt
 
-file_semaphore = threading.Semaphore(512)
 class FileDownload:
     def __init__(self, depot_downloader, filemapping):
         self.depot_downloader = depot_downloader
-        self.tqdm: tqdm = self.depot_downloader.tqdm
         self.manifest = self.depot_downloader.manifest
         depotfile = DepotFile(self.manifest, filemapping)
         self.chunk_dict = self.depot_downloader.chunk_dict
@@ -91,10 +88,7 @@ class FileDownload:
                     self.path.parent.mkdir(parents=True, exist_ok=True)
                 if not self.path.exists():
                     with self.path.open("wb") as file:
-                        if hasattr(os, 'posix_fallocate'):
-                            os.posix_fallocate(file.fileno(), 0, depotfile.size)
-                        else:
-                            file.truncate(depotfile.size)
+                        file.truncate(depotfile.size)
         if self.filepath.as_posix() not in self.chunk_dict:
             self.chunk_dict[self.filepath.as_posix()] = []
 
@@ -103,13 +97,9 @@ class FileDownload:
     def download_chunk_and_save(self, chunk, max_attempts=5):
         chunk_id = chunk.sha.hex()
         data = self.get_chunk(chunk_id, max_attempts)
-        with file_semaphore, self.lock:
-                with self.path.open('rb+') as file:
-                    file.seek(chunk.offset, 0)
-                    file.write(data)
-        self.chunk_dict[self.filepath.as_posix()].append(f'{chunk.offset}_{chunk.sha.hex()}')
-        self.tqdm.set_postfix(filename=str(self.filepath)[-(shutil.get_terminal_size().columns // 4):])
-        self.tqdm.update(chunk.cb_original)
+        with self.lock, self.path.open('rb+') as file:
+            file.seek(chunk.offset, 0)
+            file.write(data)
 
     def get_chunk(self, chunk_id, max_attempts=5):
         server, token = self.depot_downloader.get_content_server()
@@ -262,8 +252,7 @@ class SingletonDeque(deque):
 
 class DepotDownloader:
     def __init__(self, manifest_path, depot_key, thread_num=32, save_path=None, servers=None,
-                 level=logging.INFO, retry_num=5, expect_logged_in=False, max_servers=20, appid=0,
-                 file_open_num=32, use_websocket=False, cellid=0):
+                 level=logging.INFO, retry_num=5, expect_logged_in=False, max_servers=20, appid=0, use_websocket=False, cellid=0):
         self.lock = Semaphore(1)
         self.expect_logged_in = expect_logged_in
         if expect_logged_in:
@@ -280,7 +269,6 @@ class DepotDownloader:
         self.cellid = cellid
         self.retry_num = retry_num
         self.thread_num = int(thread_num)
-        self.file_open_num = int(file_open_num)
         self.max_servers = int(max_servers)
         self.log = logging.getLogger(self.__class__.__name__)
         logging.basicConfig(format='%(asctime)s - %(pathname)s[line:%(lineno)d] - %(levelname)s: %(message)s',
@@ -306,8 +294,10 @@ class DepotDownloader:
         self.servers = SingletonDeque()
         self.num_entries_in_client_list = 0 # num of how many cdn auth token server can be used
         self.get_content_server(servers, fetch_all_cdn_token=True)
-        self.tqdm = tqdm(total=self.manifest.metadata.cb_disk_original, unit='B', unit_scale=True, leave=True)
-        self.tqdm.set_description_str(f'Depot {self.depot_id}')
+        self.tqdm = tqdm(
+            total=self.manifest.metadata.cb_disk_original,
+            desc=f'Depot {self.depot_id}',
+            unit='B', unit_scale=True, leave=False)
 
     def _get_chunk_saves(self):
         matching_files = [p for p in Path.cwd().glob(f'*% - {self.depot_id}.json') if p.is_file()]
@@ -372,59 +362,61 @@ class DepotDownloader:
 
         return server_str, token
 
-    def download_file(self, filemapping, pool):
-        filemapping.chunks.sort(key=lambda x: x.offset)
-        d = FileDownload(self, filemapping)
-        result_list = []
-        for chunk in filemapping.chunks:
-            if f'{chunk.offset}_{chunk.sha.hex()}' not in self.chunk_dict[d.filepath.as_posix()]:
-                result_list.append(
-                    pool.apply_async(
-                        d.download_chunk_and_save,
-                        (chunk, self.retry_num,),
-                        callback=self.save_chunk_dict))
-            else:
-                self.tqdm.update(chunk.cb_original)
-        try:
-            for result in result_list:
-                result.get()
-        except KeyboardInterrupt:
-            pass
-
     def download(self):
-        result_list = []
-        for file_mapping in self.manifest.payload.mappings:
-            file_mapping.chunks.sort(key=lambda x: x.offset)
-            file_downloader = FileDownload(self, file_mapping)
-            for chunk in file_mapping.chunks:
-                if f'{chunk.offset}_{chunk.sha.hex()}' not in self.chunk_dict[file_downloader.filepath.as_posix()]:
-                    #print(chunk.sha.hex())
-                    #file_downloader.download_chunk_and_save(chunk, self.retry_num)
-                    #greenlet = gevent.spawn(file_downloader.download_chunk_and_save, chunk, self.retry_num)
-                    #greenlet.start()
-                    #greenlet.add_spawn_callback(self.save_chunk_dict)
-                    #result_list.append(greenlet)
-                    t = threading.Thread(target=file_downloader.download_chunk_and_save, args=(chunk, self.retry_num,))
-                    result_list.append(t)
-                    t.start()
-                else:
-                    self.tqdm.update(chunk.cb_original)
-        for t in result_list:
-            t.join()
-        #try:
-            #gevent.joinall(result_list)
-        #except KeyboardInterrupt:
-        #    pass
+        with ThreadPoolExecutor(max_workers=self.thread_num) as executor:
+            futures = []
+            downloaded_size = 0
+            for file_mapping in self.manifest.payload.mappings:
+                file_mapping.chunks.sort(key=lambda x: x.offset)
+                file_downloader = FileDownload(self, file_mapping)
+                filepath_key = file_downloader.filepath.as_posix()
+
+                for chunk in file_mapping.chunks:
+                    chunk_key = f'{chunk.offset}_{chunk.sha.hex()}'
+                    
+                    if chunk_key not in self.chunk_dict.get(filepath_key, {}):
+                        # 提交下载任务到线程池
+                        future = executor.submit(
+                            file_downloader.download_chunk_and_save,
+                            chunk,
+                            self.retry_num
+                        )
+                        # 添加回调以处理结果和进度更新
+                        future.add_done_callback(
+                            lambda f, c=chunk, path=filepath_key: self._handle_chunk_result(f, c, path)
+                        )
+                        futures.append(future)
+                    else:
+                        # 已存在的块直接更新进度
+                        downloaded_size += chunk.cb_original
+                        #self.tqdm.update(chunk.cb_original)
+            self.tqdm = tqdm(
+                total=self.manifest.metadata.cb_disk_original,
+                initial=downloaded_size,
+                desc=f'Depot {self.depot_id}',
+                unit='B', unit_scale=True, leave=True)
+
+    def _handle_chunk_result(self, future, chunk, path):
+        """线程完成后的回调函数"""
+        try:
+            future.result()  # 显式获取结果以捕获异常
+            self.chunk_dict[path].append(f'{chunk.offset}_{chunk.sha.hex()}')
+            self.tqdm.set_postfix(filename=str(path)[-(shutil.get_terminal_size().columns // 4):])
+            self.tqdm.update(chunk.cb_original)
+            self.save_chunk_dict()
+        except Exception as e:
+            print(f"Chunk {chunk.offset} download failed: {str(e)}")
+            # 这里可以添加重试逻辑
+
 
     def save_chunk_dict(self, r=None):
         if self.lock.acquire(blocking=False):
             try:
-                with self.chunk_dict_path.open('r+', encoding='utf-8') as f:
-                    json.dump(dict(self.chunk_dict), f)
-
                 percentage = round(self.tqdm.n / self.tqdm.total * 100, 1)
                 name = self.chunk_dict_path.with_name(f'{percentage}% - {self.depot_id}.json')
                 if self.chunk_dict_path != name:
+                    with self.chunk_dict_path.open('r+', encoding='utf-8') as f:
+                        json.dump(dict(self.chunk_dict), f)
                     self.chunk_dict_path = self.chunk_dict_path.rename(name)
             finally:
                 self.lock.release()
@@ -489,7 +481,7 @@ def main(new_args=None):
         for manifest_path, depot_key in manifest_path_depot_key_dict.items():
             if manifest_path and depot_key:
                 d = DepotDownloader(manifest_path, depot_key, args.thread_num, save_path, server_set, level,
-                                    args.retry_num, args.login_anonymous, 20, args.appid, args.file_open_num,
+                                    args.retry_num, args.login_anonymous, 20, args.appid,
                                     args.use_websocket, args.cellid)
                 d.download()
 
