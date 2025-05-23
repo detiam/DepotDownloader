@@ -1,5 +1,4 @@
 import os
-import threading
 import vdf
 import time
 import lzma
@@ -15,6 +14,7 @@ from binascii import crc32, unhexlify
 from zipfile import ZipFile
 from collections import deque
 from gevent.lock import Semaphore
+from threading import Lock
 from urllib3.util import parse_url
 from requests.adapters import HTTPAdapter
 from concurrent.futures import ThreadPoolExecutor
@@ -68,29 +68,30 @@ from steam.core.manifest import DepotManifest, DepotFile
 from steam.core.crypto import symmetric_decrypt
 
 class FileDownload:
-    def __init__(self, depot_downloader, filemapping):
+    def __init__(self, depot_downloader, depot_file:DepotFile):
         self.depot_downloader = depot_downloader
-        self.manifest = self.depot_downloader.manifest
-        depotfile = DepotFile(self.manifest, filemapping)
-        self.chunk_dict = self.depot_downloader.chunk_dict
+        chunk_dict = self.depot_downloader.chunk_dict
         self.depot_id = self.depot_downloader.depot_id
         self.depot_key = self.depot_downloader.depot_key
         self.log = self.depot_downloader.log
-        self.filepath = Path(depotfile.filename)
-        self.path:Path = self.depot_downloader.save_path / self.filepath
+        filepath = Path(depot_file.filename)
+        self.path:Path = self.depot_downloader.save_path / filepath
         self.lock = Semaphore(1)
 
-        if not depotfile.is_directory:
+        if not depot_file.is_directory:
             if not self.path.exists():
-                if self.filepath.as_posix() in self.chunk_dict:
-                    self.chunk_dict[self.filepath.as_posix()] = []
+                if filepath.as_posix() in chunk_dict:
+                    chunk_dict[filepath.as_posix()] = []
                 if not self.path.parent.exists():
                     self.path.parent.mkdir(parents=True, exist_ok=True)
                 if not self.path.exists():
                     with self.path.open("wb") as file:
-                        file.truncate(depotfile.size)
-        if self.filepath.as_posix() not in self.chunk_dict:
-            self.chunk_dict[self.filepath.as_posix()] = []
+                        if hasattr(os, 'posix_fallocate') and depot_file.size > 3:
+                            os.posix_fallocate(file.fileno(), 0, depot_file.size)
+                        else:
+                            file.truncate(depot_file.size)
+        if filepath.as_posix() not in chunk_dict:
+            chunk_dict[filepath.as_posix()] = []
 
     #def download_file():
 
@@ -253,7 +254,7 @@ class SingletonDeque(deque):
 class DepotDownloader:
     def __init__(self, manifest_path, depot_key, thread_num=32, save_path=None, servers=None,
                  level=logging.INFO, retry_num=5, expect_logged_in=False, max_servers=20, appid=0, use_websocket=False, cellid=0):
-        self.lock = Semaphore(1)
+        self.lock = Lock()
         self.expect_logged_in = expect_logged_in
         if expect_logged_in:
             self.client = SteamClient()
@@ -281,10 +282,9 @@ class DepotDownloader:
         self.chunk_dict_path = self._get_chunk_saves()
         self.save_path = Path(save_path) if save_path else Path(str(self.depot_id))
         try:
-            with self.lock:
-                with self.chunk_dict_path.open(encoding='utf-8') as f:
-                    self.chunk_dict = SingletonDict(json.load(f))
-        except json.decoder.JSONDecodeError:
+            with self.lock, self.chunk_dict_path.open(encoding='utf-8') as f:
+                self.chunk_dict = SingletonDict(json.load(f))
+        except json.decoder.JSONDecodeError as e:
             self.chunk_dict = SingletonDict()
         self.web = make_requests_session()
         self.web.headers['Cache-Control'] = 'no-cache'
@@ -297,7 +297,7 @@ class DepotDownloader:
         self.tqdm = tqdm(
             total=self.manifest.metadata.cb_disk_original,
             desc=f'Depot {self.depot_id}',
-            unit='B', unit_scale=True, leave=False)
+            unit='B', unit_scale=True, leave=True)
 
     def _get_chunk_saves(self):
         matching_files = [p for p in Path.cwd().glob(f'*% - {self.depot_id}.json') if p.is_file()]
@@ -364,17 +364,15 @@ class DepotDownloader:
 
     def download(self):
         with ThreadPoolExecutor(max_workers=self.thread_num) as executor:
-            futures = []
-            downloaded_size = 0
             for file_mapping in self.manifest.payload.mappings:
                 file_mapping.chunks.sort(key=lambda x: x.offset)
-                file_downloader = FileDownload(self, file_mapping)
-                filepath_key = file_downloader.filepath.as_posix()
+                depot_file = DepotFile(self.manifest, file_mapping)
+                file_downloader = FileDownload(self, depot_file)
 
                 for chunk in file_mapping.chunks:
                     chunk_key = f'{chunk.offset}_{chunk.sha.hex()}'
-                    
-                    if chunk_key not in self.chunk_dict.get(filepath_key, {}):
+
+                    if chunk_key not in self.chunk_dict.get(depot_file.filename, {}):
                         # 提交下载任务到线程池
                         future = executor.submit(
                             file_downloader.download_chunk_and_save,
@@ -383,45 +381,35 @@ class DepotDownloader:
                         )
                         # 添加回调以处理结果和进度更新
                         future.add_done_callback(
-                            lambda f, c=chunk, path=filepath_key: self._handle_chunk_result(f, c, path)
+                            lambda f, c=chunk, path=depot_file.filename: self._handle_chunk_result(f, c, path)
                         )
-                        futures.append(future)
                     else:
                         # 已存在的块直接更新进度
-                        downloaded_size += chunk.cb_original
-                        #self.tqdm.update(chunk.cb_original)
-            self.tqdm = tqdm(
-                total=self.manifest.metadata.cb_disk_original,
-                initial=downloaded_size,
-                desc=f'Depot {self.depot_id}',
-                unit='B', unit_scale=True, leave=True)
+                        self.tqdm.update(chunk.cb_original)
 
     def _handle_chunk_result(self, future, chunk, path):
         """线程完成后的回调函数"""
         try:
             future.result()  # 显式获取结果以捕获异常
-            self.chunk_dict[path].append(f'{chunk.offset}_{chunk.sha.hex()}')
             self.tqdm.set_postfix(filename=str(path)[-(shutil.get_terminal_size().columns // 4):])
             self.tqdm.update(chunk.cb_original)
-            self.save_chunk_dict()
+            with self.lock:
+                self.chunk_dict[path].append(f'{chunk.offset}_{chunk.sha.hex()}')
+                self.save_chunk_dict()
         except Exception as e:
             print(f"Chunk {chunk.offset} download failed: {str(e)}")
             # 这里可以添加重试逻辑
 
 
-    def save_chunk_dict(self, r=None):
-        if self.lock.acquire(blocking=False):
-            try:
-                percentage = round(self.tqdm.n / self.tqdm.total * 100, 1)
-                name = self.chunk_dict_path.with_name(f'{percentage}% - {self.depot_id}.json')
-                if self.chunk_dict_path != name:
-                    with self.chunk_dict_path.open('r+', encoding='utf-8') as f:
-                        json.dump(dict(self.chunk_dict), f)
-                    self.chunk_dict_path = self.chunk_dict_path.rename(name)
-            finally:
-                self.lock.release()
-        else:
-            return
+    def save_chunk_dict(self):
+        #if self.lock.acquire(blocking=False):
+            percentage = int(round(self.tqdm.n / self.tqdm.total * 100))
+            new_name = f'{percentage}% - {self.depot_id}.json'
+            if self.chunk_dict_path.name != new_name:
+                with self.chunk_dict_path.open('w', encoding='utf-8') as f:
+                    json.dump(dict(self.chunk_dict), f)
+                self.chunk_dict_path = self.chunk_dict_path.replace(self.chunk_dict_path.with_name(new_name))
+            #self.lock.release()
 
 def get_manifest_path_depot_key_dict(path):
     path = Path(path)
