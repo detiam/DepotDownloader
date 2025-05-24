@@ -367,10 +367,11 @@ class DepotDownloader:
     def save_chunk_dict(self):
         #if self.lock.acquire(blocking=False):
             percentage = int(round(self.tqdm.n / self.tqdm.total * 100))
+            chunk_dict_for_save = self.chunk_dict.copy()
             new_name = f'{percentage}% - {self.depot_id}.json'
             if self.chunk_dict_path.name != new_name:
                 with self.chunk_dict_path.open('r+', encoding='utf-8') as f:
-                    json.dump(self.chunk_dict, f)
+                    json.dump(chunk_dict_for_save, f)
                 self.chunk_dict_path = self.chunk_dict_path.replace(self.chunk_dict_path.with_name(new_name))
             #self.lock.release()
 
