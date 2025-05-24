@@ -13,8 +13,7 @@ from pathlib import Path
 from binascii import crc32, unhexlify
 from zipfile import ZipFile
 from collections import deque
-from gevent.lock import Semaphore
-from threading import Lock
+from threading import RLock as Lock
 from urllib3.util import parse_url
 from requests.adapters import HTTPAdapter
 from concurrent.futures import ThreadPoolExecutor
@@ -76,7 +75,7 @@ class FileDownload:
         self.log = self.depot_downloader.log
         filepath = Path(depot_file.filename)
         self.path:Path = self.depot_downloader.save_path / filepath
-        self.lock = Semaphore(1)
+        self.lock = Lock()
 
         if not depot_file.is_directory:
             if not self.path.exists():
@@ -151,42 +150,6 @@ class FileDownload:
             server, token = self.depot_downloader.get_content_server(rotate=True)
 
 
-class SingletonDict(dict):
-    _instance = None
-    _initialized = False
-
-    def __new__(cls, *args, **kwargs):
-        if not cls._instance:
-            cls._instance = super().__new__(cls, *args, **kwargs)
-        return cls._instance
-
-    def __init__(self, *args, **kwargs):
-        if not self._initialized:
-            self._initialized = True
-            self._lock = Semaphore(1)
-            super().__init__(*args, **kwargs)
-
-    def __getitem__(self, key):
-        with self._lock:
-            return super().__getitem__(key)
-
-    def __setitem__(self, key, value):
-        with self._lock:
-            return super().__setitem__(key, value)
-
-    def __delitem__(self, key):
-        with self._lock:
-            return super().__delitem__(key)
-
-    def __len__(self):
-        with self._lock:
-            return super().__len__()
-
-    def __contains__(self, key):
-        with self._lock:
-            return super().__contains__(key)
-
-
 class SingletonDeque(deque):
     _instance = None
     _initialized = False
@@ -199,7 +162,7 @@ class SingletonDeque(deque):
     def __init__(self, *args, **kwargs):
         if not self._initialized:
             self._initialized = True
-            self._lock = Semaphore(1)
+            self._lock = Lock()
             super().__init__(*args, **kwargs)
 
     def append(self, item):
@@ -283,9 +246,9 @@ class DepotDownloader:
         self.save_path = Path(save_path) if save_path else Path(str(self.depot_id))
         try:
             with self.lock, self.chunk_dict_path.open(encoding='utf-8') as f:
-                self.chunk_dict = SingletonDict(json.load(f))
-        except json.decoder.JSONDecodeError as e:
-            self.chunk_dict = SingletonDict()
+                self.chunk_dict:dict = json.load(f)
+        except json.decoder.JSONDecodeError:
+            self.chunk_dict = dict()
         self.web = make_requests_session()
         self.web.headers['Cache-Control'] = 'no-cache'
         adapters = HTTPAdapter(self.max_servers, self.thread_num, 0, True)
@@ -406,8 +369,8 @@ class DepotDownloader:
             percentage = int(round(self.tqdm.n / self.tqdm.total * 100))
             new_name = f'{percentage}% - {self.depot_id}.json'
             if self.chunk_dict_path.name != new_name:
-                with self.chunk_dict_path.open('w', encoding='utf-8') as f:
-                    json.dump(dict(self.chunk_dict), f)
+                with self.chunk_dict_path.open('r+', encoding='utf-8') as f:
+                    json.dump(self.chunk_dict, f)
                 self.chunk_dict_path = self.chunk_dict_path.replace(self.chunk_dict_path.with_name(new_name))
             #self.lock.release()
 
