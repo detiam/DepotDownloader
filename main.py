@@ -260,7 +260,7 @@ class DepotDownloader:
         self.tqdm = tqdm(
             total=self.manifest.metadata.cb_disk_original,
             desc=f'Depot {self.depot_id}',
-            unit='B', unit_scale=True, leave=True)
+            unit='B', unit_scale=True, leave=False)
 
     def _get_chunk_saves(self):
         matching_files = [p for p in Path.cwd().glob(f'*% - {self.depot_id}.json') if p.is_file()]
