@@ -133,7 +133,10 @@ class FileDownload:
                     chunk_dict[filepath.as_posix()] = []
                 if not self.path.parent.exists():
                     self.path.parent.mkdir(parents=True, exist_ok=True)
-                if not self.path.exists():
+                if self.path.exists():
+                    with self.path.open("rb+") as file:
+                        file.truncate(depot_file.size)
+                else:
                     with self.path.open("wb") as file:
                         if hasattr(os, 'posix_fallocate') and depot_file.size > 3:
                             os.posix_fallocate(file.fileno(), 0, depot_file.size)
