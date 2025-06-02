@@ -207,7 +207,7 @@ class FileDownload:
                              self.path, chunk_id, attempt+1, max_attempts, exp)
 
                 if attempt == max_attempts - 1:
-                    self.log.error(f"Failed to download chunk {chunk_id} after {max_attempts} attempts")
+                    self.log.error(f"Failed to download chunk {chunk_id} after {max_attempts} attempts, {exp}")
                     raise
 
             # Get a new server for the next attempt
