@@ -21,22 +21,42 @@ from concurrent.futures import ThreadPoolExecutor, Future, wait
 
 from steam.utils.web import make_requests_session, APIHost, DEFAULT_PARAMS
 
-parser = argparse.ArgumentParser(add_help=True)
-parser.add_argument('-t', '--thread-num', type=int, default=32)
-parser.add_argument('-o', '--save-path', type=str)
-parser.add_argument('-c', '--login-anonymous', action='store_true',
-                    help=f'login anonymously and enable request cdn auth token')
-parser.add_argument('-s', '--server', type=str, dest='server_list', action='append', nargs='?')
-parser.add_argument('-a', '--apihost', type=str, default='Public',
-                    help=f'available: {APIHost._member_names_} or a custom string')
-parser.add_argument('-i', '--appid', type=int, default=0)
-parser.add_argument('-e', '--cellid', type=int, default=0)
-parser.add_argument('-l', '--level', type=str, default='INFO')
-parser.add_argument('-r', '--retry-num', type=int, default=5)
-parser.add_argument('--use-http', action='store_true')
-parser.add_argument('--use-websocket', action='store_true')
+parser = argparse.ArgumentParser(
+    add_help=True,
+    description='Depot Downloader, write in Python.',
+    epilog='Use Ctrl+C to cancel the download, double-tap to cancel all downloads.')
 
-subparsers = parser.add_subparsers(dest='command', required=True)
+parser.add_argument('-r', '--retry', type=int, default=5,
+    help='how many retries for downloading a chunk, default 5')
+parser.add_argument('-t', '--thread', type=int, default=32,
+    help='how many chunk downloading in parallel, default 32')
+parser.add_argument('-o', '--output', type=str,
+    help='where to save files, default is a folder named after the depot id or app name in the current directory')
+parser.add_argument('-log', '--level', type=str, default='INFO',
+    help=f'available: {list(logging._levelToName.values())}')
+
+auth_group = parser.add_argument_group('authentication options')
+auth_group.add_argument('-l', '--login-anonymously', action='store_true',
+    help='required for request cdn auth token')
+auth_group.add_argument('-a', '--app-id', type=int, default=0,
+    help='optional for request cdn auth token')
+auth_group.add_argument('-c', '--cell-id', type=int, default=0,
+    help='the overridden CellID of the content server to download from')
+
+conn_group = parser.add_argument_group('connection options')
+conn_group.add_argument('-u', '--api-host', type=str, default='Public',
+    help=f'available: {APIHost._member_names_} or a custom string')
+conn_group.add_argument('-s', '--server', type=str, dest='server_list', action='append', nargs='?',
+    help='content server list')
+conn_group.add_argument('-m', '--max-servers', type=int, default=20,
+    help='how many content server can be obtained and used at most')
+conn_group.add_argument('--use-http', action='store_true',
+    help='use HTTP for connection')
+conn_group.add_argument('--use-websocket', action='store_true',
+    help='use WEBSOCKET for connection')
+
+subparsers = parser.add_subparsers(dest='command', required=True,
+    help='command')
 
 app_parser = subparsers.add_parser('app')
 app_parser.add_argument('-p', '--app-path', type=str, required=True)
@@ -50,9 +70,9 @@ args = parser.parse_args()
 DEFAULT_PARAMS['https'] = not args.use_http
 
 try:
-    DEFAULT_PARAMS['apihost'] = APIHost[args.apihost].value
+    DEFAULT_PARAMS['apihost'] = APIHost[args.api_host].value
 except:
-    DEFAULT_PARAMS['apihost'] = args.apihost
+    DEFAULT_PARAMS['apihost'] = args.api_host
 
 # China apihost only support websocket
 if DEFAULT_PARAMS['apihost'] == APIHost.China.value:
@@ -380,7 +400,6 @@ class DepotDownloader:
                 print(f'Depot {self.depot_id}:	cancelled')
 
     def _handle_chunk_result(self, future:Future, chunk, path):
-        """线程完成后的回调函数"""
         if future.cancelled():
             return
         #future.result()
@@ -437,12 +456,8 @@ def main(new_args=None):
     global args
     if new_args:
         args = parser.parse_args(new_args)
-    if args.level:
-        level = logging.getLevelName(args.level.upper())
-    else:
-        level = logging.INFO
     manifest_path_depot_key_dict = {}
-    save_path = args.save_path
+    save_path = args.output
     if args.command == 'app':
         manifest_path_depot_key_dict = get_manifest_path_depot_key_dict(args.app_path)
         if manifest_path_depot_key_dict and args.app_path and not save_path:
@@ -457,9 +472,9 @@ def main(new_args=None):
     if manifest_path_depot_key_dict:
         for manifest_path, depot_key in manifest_path_depot_key_dict.items():
             if manifest_path and depot_key:
-                d = DepotDownloader(manifest_path, depot_key, args.thread_num, save_path, server_set, level,
-                                    args.retry_num, args.login_anonymous, 20, args.appid,
-                                    args.use_websocket, args.cellid)
+                d = DepotDownloader(manifest_path, depot_key, args.thread, save_path, server_set, args.level,
+                                    args.retry, args.login_anonymously, args.max_servers, args.app_id,
+                                    args.use_websocket, args.cell_id)
                 d.download()
 
 if __name__ == '__main__':
