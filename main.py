@@ -87,6 +87,21 @@ from steam.core.connection import WebsocketConnection
 from steam.core.manifest import DepotManifest, DepotFile
 from steam.core.crypto import symmetric_decrypt
 
+_win_exit_flag=False
+if sys.platform == 'win32':
+    from win32api import SetConsoleCtrlHandler
+    from win32con import CTRL_BREAK_EVENT
+    def _win_interrupt_handler(dwCtrlType):
+        global _win_exit_flag
+        if dwCtrlType != CTRL_BREAK_EVENT:
+            _unregister()
+            _win_exit_flag = True
+            return 1
+        return 0
+    def _unregister():
+        SetConsoleCtrlHandler(_win_interrupt_handler, 0)
+    SetConsoleCtrlHandler(_win_interrupt_handler, 1)
+
 if sys.platform != "win32":
     import atexit
     import termios
@@ -251,6 +266,7 @@ class SingletonDeque(deque):
 class DepotDownloader:
     def __init__(self, manifest_path, depot_key, thread_num=32, save_path=None, servers=None,
                  level=logging.INFO, retry_num=5, expect_logged_in=False, max_servers=20, appid=0, use_websocket=False, cellid=0):
+        self._win_exit_flag = False
         self.lock = Lock()
         self.expect_logged_in = expect_logged_in
         if expect_logged_in:
@@ -384,7 +400,24 @@ class DepotDownloader:
                         else:
                             self.tqdm.update(chunk.cb_original)
 
+                if sys.platform == 'win32':
+                    from win32api import SetConsoleCtrlHandler
+                    from win32con import CTRL_BREAK_EVENT
+                    def _win_interrupt_handler(dwCtrlType):
+                        if dwCtrlType != CTRL_BREAK_EVENT:
+                            _unregister()
+                            for f in futures:
+                                f.cancel()
+                            self._win_exit_flag = True
+                            return 1
+                        return 0
+                    def _unregister():
+                        SetConsoleCtrlHandler(_win_interrupt_handler, 0)
+                    SetConsoleCtrlHandler(_win_interrupt_handler, 1)
+
                 _, not_done = wait(futures, return_when='FIRST_EXCEPTION')
+                if self._win_exit_flag:
+                    raise KeyboardInterrupt
                 if not_done:
                     executor.shutdown(wait=True, cancel_futures=True)
                     self.tqdm.close()
@@ -472,6 +505,8 @@ def main(new_args=None):
     if manifest_path_depot_key_dict:
         for manifest_path, depot_key in manifest_path_depot_key_dict.items():
             if manifest_path and depot_key:
+                if _win_exit_flag:
+                    raise KeyboardInterrupt
                 d = DepotDownloader(manifest_path, depot_key, args.thread, save_path, server_set, args.level,
                                     args.retry, args.login_anonymously, args.max_servers, args.app_id,
                                     args.use_websocket, args.cell_id)
