@@ -371,14 +371,14 @@ class DepotDownloader:
                     for chunk in file_mapping.chunks:
                         chunk_key = f'{chunk.offset}_{chunk.sha.hex()}'
 
-                        if chunk_key not in self.chunk_dict.get(depot_file.filename, {}):
+                        if chunk_key not in self.chunk_dict.get(Path(depot_file.filename).as_posix(), {}):
                             future = executor.submit(
                                 file_downloader.download_chunk_and_save,
                                 chunk,
                                 self.retry_num
                             )
                             future.add_done_callback(
-                                lambda f, c=chunk, path=depot_file.filename: self._handle_chunk_result(f, c, path)
+                                lambda f, c=chunk, path=Path(depot_file.filename).as_posix(): self._handle_chunk_result(f, c, path)
                             )
                             futures.append(future)
                         else:
@@ -399,11 +399,11 @@ class DepotDownloader:
                 self.tqdm.close()
                 print(f'Depot {self.depot_id}:	cancelled')
 
-    def _handle_chunk_result(self, future:Future, chunk, path):
+    def _handle_chunk_result(self, future:Future, chunk, path:str):
         if future.cancelled():
             return
         #future.result()
-        self.tqdm.set_postfix(filename=str(path)[-(shutil.get_terminal_size().columns // 4):])
+        self.tqdm.set_postfix(filename=path[-(shutil.get_terminal_size().columns // 4):])
         self.tqdm.update(chunk.cb_original)
         with self.lock:
             self.chunk_dict[path].append(f'{chunk.offset}_{chunk.sha.hex()}')
