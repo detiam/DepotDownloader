@@ -314,7 +314,7 @@ class DepotDownloader:
                     self.num_entries_in_client_list = server.get('num_entries_in_client_list', 0)
                 if server_str not in self.servers:
                     self.servers.append(server_str)
-                    self.log.info('Appended server: ' + server_str)
+                    self.log.debug('Appended server: ' + server_str)
 
         if not self.servers:
             raise SteamError("Failed to fetch content servers")
@@ -334,7 +334,7 @@ class DepotDownloader:
                     break
                 else:
                     self.servers.remove(server_str)
-                    self.log.info(f'Removed server: {server_str} because error code {result['eresult']} when try to get cdn auth token.')
+                    self.log.warning(f'Removed server: {server_str}\nBecause error code {result['eresult']} when try to get cdn auth token.')
                     server_str = self.servers[0]
 
         return server_str, token
@@ -342,28 +342,28 @@ class DepotDownloader:
     def download(self):
         with ThreadPoolExecutor(max_workers=self.thread_num) as executor:
             futures:list[Future] = []
-            for file_mapping in self.manifest.payload.mappings:
-                file_mapping.chunks.sort(key=lambda x: x.offset)
-                depot_file = DepotFile(self.manifest, file_mapping)
-                file_downloader = FileDownload(self, depot_file)
-
-                for chunk in file_mapping.chunks:
-                    chunk_key = f'{chunk.offset}_{chunk.sha.hex()}'
-
-                    if chunk_key not in self.chunk_dict.get(depot_file.filename, {}):
-                        future = executor.submit(
-                            file_downloader.download_chunk_and_save,
-                            chunk,
-                            self.retry_num
-                        )
-                        future.add_done_callback(
-                            lambda f, c=chunk, path=depot_file.filename: self._handle_chunk_result(f, c, path)
-                        )
-                        futures.append(future)
-                    else:
-                        self.tqdm.update(chunk.cb_original)
-
             try:
+                for file_mapping in self.manifest.payload.mappings:
+                    file_mapping.chunks.sort(key=lambda x: x.offset)
+                    depot_file = DepotFile(self.manifest, file_mapping)
+                    file_downloader = FileDownload(self, depot_file)
+
+                    for chunk in file_mapping.chunks:
+                        chunk_key = f'{chunk.offset}_{chunk.sha.hex()}'
+
+                        if chunk_key not in self.chunk_dict.get(depot_file.filename, {}):
+                            future = executor.submit(
+                                file_downloader.download_chunk_and_save,
+                                chunk,
+                                self.retry_num
+                            )
+                            future.add_done_callback(
+                                lambda f, c=chunk, path=depot_file.filename: self._handle_chunk_result(f, c, path)
+                            )
+                            futures.append(future)
+                        else:
+                            self.tqdm.update(chunk.cb_original)
+
                 _, not_done = wait(futures, return_when='FIRST_EXCEPTION')
                 if not_done:
                     executor.shutdown(wait=True, cancel_futures=True)
@@ -373,11 +373,11 @@ class DepotDownloader:
                     with self.lock:
                         self.save_chunk_dict()
                     self.tqdm.close()
-                    print(f'Depot {self.depot_id}: completed')
+                    print(f'Depot {self.depot_id}:	completed')
             except KeyboardInterrupt:
                 executor.shutdown(wait=True, cancel_futures=True)
                 self.tqdm.close()
-                print(f'Depot {self.depot_id}: cancelled')
+                print(f'Depot {self.depot_id}:	cancelled')
 
     def _handle_chunk_result(self, future:Future, chunk, path):
         """线程完成后的回调函数"""
@@ -463,4 +463,7 @@ def main(new_args=None):
                 d.download()
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print('All downloads cancelled')
