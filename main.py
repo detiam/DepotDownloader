@@ -11,7 +11,6 @@ import argparse
 from tqdm import tqdm
 from io import BytesIO
 from pathlib import Path
-from zstd import ZSTD_uncompress
 from binascii import crc32, unhexlify
 from zipfile import ZipFile
 from collections import deque
@@ -19,6 +18,8 @@ from threading import RLock as Lock
 from urllib3.util import parse_url
 from requests.adapters import HTTPAdapter
 from concurrent.futures import ThreadPoolExecutor, Future, wait
+from zstandard import ZstdDecompressor
+ZSTD_uncompress = ZstdDecompressor().decompress
 
 from steam.utils.web import make_requests_session, APIHost, DEFAULT_PARAMS
 
