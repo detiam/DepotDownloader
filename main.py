@@ -18,8 +18,7 @@ from threading import RLock as Lock
 from urllib3.util import parse_url
 from requests.adapters import HTTPAdapter
 from concurrent.futures import ThreadPoolExecutor, Future, wait
-from zstandard import ZstdDecompressor
-ZSTD_uncompress = ZstdDecompressor().decompress
+from zstandard import decompress as ZSTD_uncompress
 
 from steam.utils.web import make_requests_session, APIHost, DEFAULT_PARAMS
 
