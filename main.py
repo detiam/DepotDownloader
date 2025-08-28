@@ -446,7 +446,8 @@ class DepotDownloader:
                     with self.lock:
                         self.save_chunk_dict()
                     self.tqdm.close()
-                    print(f'Depot {self.depot_id}:	completed')
+                    elapsed = self.tqdm.format_dict["elapsed"]
+                    print(f'Depot {self.depot_id}:	completed in {elapsed:.2f}s')
             except KeyboardInterrupt:
                 executor.shutdown(wait=True, cancel_futures=True)
                 self.tqdm.close()
