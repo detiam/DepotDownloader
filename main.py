@@ -123,6 +123,7 @@ class FileDownload:
         self.depot_id = self.depot_downloader.depot_id
         self.depot_key = self.depot_downloader.depot_key
         self.log = self.depot_downloader.log
+        self.depot_file = depot_file
         filepath = Path(depot_file.filename)
         self.path:Path = self.depot_downloader.save_path / filepath
         self.lock = Lock()
@@ -153,6 +154,7 @@ class FileDownload:
         with self.lock, self.path.open('rb+') as file:
             file.seek(chunk.offset, 0)
             file.write(data)
+            file.truncate(self.depot_file.size)
 
     def get_chunk(self, chunk_id, max_attempts=5):
         server, token = self.depot_downloader.get_content_server()
@@ -414,6 +416,8 @@ class DepotDownloader:
                             )
                             futures.append(future)
                         else:
+                            with file_downloader.path.open("rb+") as file:
+                                file.truncate(depot_file.size)
                             self.tqdm.update(chunk.cb_original)
 
                 if sys.platform == 'win32':
