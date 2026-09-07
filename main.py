@@ -129,15 +129,15 @@ if sys.platform != "win32":
     atexit.register(restore_terminal)
 
 class FileDownload:
-    def __init__(self, depot_downloader, depot_file:DepotFile):
+    def __init__(self, depot_downloader:DepotDownloader, depot_file:DepotFile, save_path=None):
         self.depot_downloader = depot_downloader
         chunk_dict = self.depot_downloader.chunk_dict
-        self.depot_id = self.depot_downloader.depot_id
         self.depot_key = self.depot_downloader.depot_key
         self.log = self.depot_downloader.log
         self.depot_file = depot_file
+        self.depot_id = self.depot_file.manifest.depot_id
         filepath = Path(depot_file.filename)
-        self.path:Path = self.depot_downloader.save_path / filepath
+        self.path:Path = (save_path or self.depot_downloader.save_path) / filepath
         self.lock = Lock()
 
         if not depot_file.is_directory:
@@ -158,7 +158,9 @@ class FileDownload:
         if filepath.as_posix() not in chunk_dict:
             chunk_dict[filepath.as_posix()] = []
 
-    #def download_file():
+    def download_file_and_save(self):
+        for chunk in self.depot_file.chunks:
+            self.download_chunk_and_save(chunk, self.depot_downloader.retry_num)
 
     def download_chunk_and_save(self, chunk, max_attempts=5):
         chunk_id = chunk.sha.hex()
@@ -338,7 +340,7 @@ class DepotDownloader:
         self.num_entries_in_client_list = 0 # num of how many cdn auth token server can be used
         self.get_content_server(servers, fetch_all_cdn_token=True)
         self.tqdm = tqdm(
-            total=self.manifest.metadata.cb_disk_original,
+            total=self.manifest.size_original,
             desc=f'Depot {self.depot_id}',
             unit='B', unit_scale=True, leave=False)
 
@@ -409,22 +411,22 @@ class DepotDownloader:
         with ThreadPoolExecutor(max_workers=self.thread_num) as executor:
             futures:list[Future] = []
             try:
-                for file_mapping in self.manifest.payload.mappings:
-                    file_mapping.chunks.sort(key=lambda x: x.offset)
-                    depot_file = DepotFile(self.manifest, file_mapping)
+                for depot_file in self.manifest:
+                    #depot_file.chunks.sort(key=lambda x: x.offset)
+                    posix_filename = Path(depot_file.filename).as_posix()
                     file_downloader = FileDownload(self, depot_file)
 
-                    for chunk in file_mapping.chunks:
+                    for chunk in depot_file.chunks:
                         chunk_key = f'{chunk.offset}_{chunk.sha.hex()}'
 
-                        if chunk_key not in self.chunk_dict.get(Path(depot_file.filename).as_posix(), {}):
+                        if chunk_key not in self.chunk_dict.get(posix_filename, {}):
                             future = executor.submit(
                                 file_downloader.download_chunk_and_save,
                                 chunk,
                                 self.retry_num
                             )
                             future.add_done_callback(
-                                lambda f, c=chunk, path=Path(depot_file.filename).as_posix(): self._handle_chunk_result(f, c, path)
+                                lambda f, ck=chunk_key, cb=chunk.cb_original, path=posix_filename: self._handle_chunk_result(f, ck, cb, path)
                             )
                             futures.append(future)
                         else:
@@ -465,14 +467,14 @@ class DepotDownloader:
                 self.tqdm.close()
                 print(f'Depot {self.depot_id}:	cancelled')
 
-    def _handle_chunk_result(self, future:Future, chunk, path:str):
+    def _handle_chunk_result(self, future:Future, chunk_key, chunk_size, path:str):
         if future.cancelled():
             return
         #future.result()
-        self.tqdm.set_postfix(filename=path[-(shutil.get_terminal_size().columns // 4):])
-        self.tqdm.update(chunk.cb_original)
+        self.tqdm.set_postfix_str(path[-(shutil.get_terminal_size().columns // 4):], False)
+        self.tqdm.update(chunk_size)
         with self.lock:
-            self.chunk_dict[path].append(f'{chunk.offset}_{chunk.sha.hex()}')
+            self.chunk_dict[path].append(chunk_key)
             percentage = int(round(self.tqdm.n / self.tqdm.total * 100))
             new_name = f'{percentage}% - {self.depot_id}.json'
             if self.chunk_dict_path.name != new_name:
