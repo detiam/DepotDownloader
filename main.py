@@ -1,3 +1,15 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.14"
+# dependencies = [
+#   "steam[client] @ git+https://github.com/detiam/steam_websocket.git@e00f4b547d1339a48195d2518845cccfa71ce669",
+#   "requests>=2.32",
+#   "tqdm>=4.67",
+#   "zstandard>=0.25",
+#   "pywin32>=311; sys_platform == 'win32'",
+# ]
+# ///
+
 import os
 import sys
 import vdf

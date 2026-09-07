@@ -1,5 +1,5 @@
 steam[client] @ git+https://github.com/detiam/steam_websocket.git@e00f4b547d1339a48195d2518845cccfa71ce669
-requests
-tqdm
-zstandard
-pywin32
+requests>=2.32
+tqdm>=4.67
+zstandard>=0.25
+pywin32>=311; sys_platform == 'win32'
