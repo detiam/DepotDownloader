@@ -11,6 +11,7 @@
 # ///
 
 import os
+import re
 import sys
 import vdf
 import time
@@ -45,6 +46,8 @@ parser.add_argument('-t', '--thread', type=int, default=32,
     help='how many chunk downloading in parallel, default 32')
 parser.add_argument('-o', '--output', type=str,
     help='where to save files, default is a folder named after the depot id or app name in the current directory')
+parser.add_argument('-p', '--pattern', type=str, dest='regex_pattern',
+    help='regex pattern to match the file path, only matched files will be downloaded')
 parser.add_argument('-log', '--level', type=str, default='INFO',
     help=f'available: {list(logging._levelToName.values())}')
 
@@ -407,13 +410,18 @@ class DepotDownloader:
 
         return server_str, token
 
-    def download(self):
+    def download(self, pattern:str=''):
+        compiled_pattern = re.compile(pattern) if pattern else None
         with ThreadPoolExecutor(max_workers=self.thread_num) as executor:
             futures:list[Future] = []
             try:
                 for depot_file in self.manifest:
                     #depot_file.chunks.sort(key=lambda x: x.offset)
                     posix_filename = Path(depot_file.filename).as_posix()
+
+                    if compiled_pattern and not compiled_pattern.search(posix_filename):
+                        continue
+
                     file_downloader = FileDownload(self, depot_file)
 
                     for chunk in depot_file.chunks:
@@ -545,7 +553,7 @@ def main(new_args=None):
                 d = DepotDownloader(manifest_path, depot_key, args.thread, save_path, server_set, args.level,
                                     args.retry, args.login_anonymously, args.max_servers, args.app_id,
                                     args.use_websocket, args.cell_id)
-                d.download()
+                d.download(args.regex_pattern)
 
 if __name__ == '__main__':
     try:
