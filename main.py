@@ -20,6 +20,7 @@ import json
 import shutil
 import struct
 import logging
+import hashlib
 import argparse
 from tqdm import tqdm
 from io import BytesIO
@@ -44,8 +45,12 @@ parser.add_argument('-r', '--retry', type=int, default=5,
     help='how many retries for downloading a chunk, default 5')
 parser.add_argument('-t', '--thread', type=int, default=32,
     help='how many chunk downloading in parallel, default 32')
+parser.add_argument('-i', '--integrity', action='store_true', dest='verify_integrity',
+    help='verify the integrity of downloaded files')
 parser.add_argument('-o', '--output', type=str,
-    help='where to save files, default is a folder named after the depot id or app name in the current directory')
+    help='output directory to save the downloaded files')
+parser.add_argument('-d', '--delete', action='store_true', dest='delete_unmatched',
+    help='delete files that are in the output directory but not in the manifest')
 parser.add_argument('-p', '--pattern', type=str, dest='regex_pattern',
     help='regex pattern to match the file path, only matched files will be downloaded')
 parser.add_argument('-log', '--level', type=str, default='INFO',
@@ -134,32 +139,56 @@ if sys.platform != "win32":
 class FileDownload:
     def __init__(self, depot_downloader:DepotDownloader, depot_file:DepotFile, save_path=None):
         self.depot_downloader = depot_downloader
+        self.verify_integrity = self.depot_downloader.verify_integrity
         chunk_dict = self.depot_downloader.chunk_dict
         self.depot_key = self.depot_downloader.depot_key
         self.log = self.depot_downloader.log
         self.depot_file = depot_file
         self.depot_id = self.depot_file.manifest.depot_id
-        filepath = Path(depot_file.filename)
-        self.path:Path = (save_path or self.depot_downloader.save_path) / filepath
+        filename = Path(depot_file.filename)
+        self.file_path:Path = (save_path or self.depot_downloader.save_path) / filename
         self.lock = Lock()
 
-        if not depot_file.is_directory:
-            if not self.path.exists():
-                if filepath.as_posix() in chunk_dict:
-                    chunk_dict[filepath.as_posix()] = []
-                if not self.path.parent.exists():
-                    self.path.parent.mkdir(parents=True, exist_ok=True)
-                if self.path.exists():
-                    with self.path.open("rb+") as file:
+        if depot_file.is_file:
+            if self.file_path.exists():
+                if self.verify_integrity:
+                    self.log.debug(f"Verifying integrity of {self.file_path}...")
+                    if self.depot_file.size and hashlib.file_digest(self.file_path.open('rb'), 'sha1').digest() != self.depot_file.sha_content:
+                        self.log.warning(f"File '{self.file_path}' exists but integrity check failed, redownloading.")
+                        chunk_dict[filename.as_posix()] = []
+
+                if self.file_path.stat().st_size != depot_file.size:
+                    with self.file_path.open("rb+") as file:
                         file.truncate(depot_file.size)
-                else:
-                    with self.path.open("wb") as file:
-                        if hasattr(os, 'posix_fallocate') and depot_file.size > 3:
-                            os.posix_fallocate(file.fileno(), 0, depot_file.size)
-                        else:
-                            file.truncate(depot_file.size)
-        if filepath.as_posix() not in chunk_dict:
-            chunk_dict[filepath.as_posix()] = []
+            else:
+                chunk_dict[filename.as_posix()] = []
+
+                if not self.file_path.parent.exists():
+                    self.file_path.parent.mkdir(parents=True, exist_ok=True)
+
+                with self.file_path.open("wb") as file:
+                    if hasattr(os, 'posix_fallocate') and depot_file.size > 3:
+                        os.posix_fallocate(file.fileno(), 0, depot_file.size)
+                    else:
+                        file.truncate(depot_file.size)
+
+        elif depot_file.is_directory:
+            self.file_path.mkdir(parents=True, exist_ok=True)
+
+        elif depot_file.is_symlink:
+            if self.file_path.exists():
+                self.file_path.unlink()
+
+            linktarget = Path(depot_file.linktarget)
+            self.file_path.symlink_to(
+                linktarget.as_posix(),
+                target_is_directory=True if linktarget.is_dir() else False)
+
+        if depot_file.is_executable:
+            self.file_path.chmod(self.file_path.stat().st_mode | 0o111)  # Add execute permissions
+
+        if filename.as_posix() not in chunk_dict:
+            chunk_dict[filename.as_posix()] = []
 
     def download_file_and_save(self):
         for chunk in self.depot_file.chunks:
@@ -168,7 +197,7 @@ class FileDownload:
     def download_chunk_and_save(self, chunk, max_attempts=5):
         chunk_id = chunk.sha.hex()
         data = self.get_chunk(chunk_id, max_attempts)
-        with self.lock, self.path.open('rb+') as file:
+        with self.lock, self.file_path.open('rb+') as file:
             file.seek(chunk.offset, 0)
             file.write(data)
 
@@ -185,9 +214,9 @@ class FileDownload:
 
                     if data[:2] == b'VZ':
                         if data[-2:] != b'zv':
-                            raise SteamError("%s %s VZ: Invalid footer: %s" % (self.path, chunk_id, repr(data[-2:])))
+                            raise SteamError("%s %s VZ: Invalid footer: %s" % (self.file_path, chunk_id, repr(data[-2:])))
                         if data[2:3] != b'a':
-                            raise SteamError("%s %s VZ: Invalid version: %s" % (self.path, chunk_id, repr(data[2:3])))
+                            raise SteamError("%s %s VZ: Invalid version: %s" % (self.file_path, chunk_id, repr(data[2:3])))
 
                         vzfilter = lzma._decode_filter_properties(lzma.FILTER_LZMA1, data[7:12])
                         vzdec = lzma.LZMADecompressor(lzma.FORMAT_RAW, filters=[vzfilter])
@@ -197,19 +226,19 @@ class FileDownload:
                         # together they get us the right data
                         data = vzdec.decompress(data[12:-9])[:decompressed_size]
                         if crc32(data) != checksum:
-                            raise SteamError("%s %s VZ: CRC32 checksum doesn't match for decompressed data" % (self.path, chunk_id))
+                            raise SteamError("%s %s VZ: CRC32 checksum doesn't match for decompressed data" % (self.file_path, chunk_id))
                     elif data[:3] == b'VSZ':
                         if data[-3:] != b'zsv':
-                            raise SteamError("%s %s VSZ: Invalid footer: %s" % (self.path, chunk_id, repr(data[-2:])))
+                            raise SteamError("%s %s VSZ: Invalid footer: %s" % (self.file_path, chunk_id, repr(data[-2:])))
                         if data[3:4] != b'a':
-                            raise SteamError("%s %s VSZ: Invalid version: %s" % (self.path, chunk_id, repr(data[2:3])))
+                            raise SteamError("%s %s VSZ: Invalid version: %s" % (self.file_path, chunk_id, repr(data[2:3])))
 
                         crc32_header = struct.unpack_from('<I', data, 4)[0]
                         crc32_footer = struct.unpack_from('<I', data, -15)[0]
                         size_decompressed = struct.unpack_from('<I', data, -11)[0]
                         data = ZSTD_uncompress(data[8 : -15])[:size_decompressed]
                         if crc32(data) != crc32_header != crc32_footer:
-                            raise SteamError("%s %s VSZ: CRC32 checksum doesn't match for decompressed data" % (self.path, chunk_id))
+                            raise SteamError("%s %s VSZ: CRC32 checksum doesn't match for decompressed data" % (self.file_path, chunk_id))
                     else:
                         with ZipFile(BytesIO(data)) as zf:
                             data = zf.read(zf.filelist[0])
@@ -219,10 +248,10 @@ class FileDownload:
                     # token missing maybe?
                     raise SteamError(f'{server}: {resp}')
                 elif 400 <= resp.status_code < 500:
-                    raise SteamError("%s %s HTTP Error %s" % (self.path, chunk_id, resp.status_code))
+                    raise SteamError("%s %s HTTP Error %s" % (self.file_path, chunk_id, resp.status_code))
             except Exception as exp:
                 self.log.debug("%s %s Request error (attempt %d/%d): %s",
-                             self.path, chunk_id, attempt+1, max_attempts, exp)
+                             self.file_path, chunk_id, attempt+1, max_attempts, exp)
 
                 if attempt == max_attempts - 1:
                     self.log.error(f"Failed to download chunk {chunk_id} after {max_attempts} attempts, {exp}")
@@ -296,13 +325,25 @@ class SingletonDeque(deque):
         with self._lock:
             return super().__reversed__()
 
+class TqdmLoggingHandler(logging.Handler):
+    def __init__(self, format_str=None):
+        super().__init__()
+        if format_str:
+            self.setFormatter(logging.Formatter(format_str))
+
+    def emit(self, record):
+        msg = self.format(record)
+        tqdm.write(msg)
 
 class DepotDownloader:
     def __init__(self, manifest_path, depot_key, thread_num=32, save_path=None, servers=None,
-                 level=logging.INFO, retry_num=5, expect_logged_in=False, max_servers=20, appid=0, use_websocket=False, cellid=0):
+                 level=logging.INFO, retry_num=5, expect_logged_in=False, max_servers=20, appid=0,
+                 use_websocket=False, cellid=0, verify_integrity=False, delete_unmatched=False):
         self._win_exit_flag = False
         self.lock = Lock()
         self.expect_logged_in = expect_logged_in
+        self.verify_integrity = verify_integrity
+        self.delete_unmatched = delete_unmatched
         if expect_logged_in:
             self.client = SteamClient()
             if use_websocket:
@@ -319,8 +360,9 @@ class DepotDownloader:
         self.thread_num = int(thread_num)
         self.max_servers = int(max_servers)
         self.log = logging.getLogger(self.__class__.__name__)
-        logging.basicConfig(format='%(asctime)s - %(pathname)s[line:%(lineno)d] - %(levelname)s: %(message)s',
-                            level=level)
+        logging.basicConfig(format='%(levelname)s: %(message)s',
+                            level=level,
+                            handlers=[TqdmLoggingHandler()])
         with open(self.manifest_path, 'rb') as f:
             content = f.read()
         self.manifest = DepotManifest(content)
@@ -414,9 +456,15 @@ class DepotDownloader:
         with ThreadPoolExecutor(max_workers=self.thread_num) as executor:
             futures:list[Future] = []
             try:
+                all_paths = {
+                    f.relative_to(self.save_path).as_posix()
+                    for f in self.save_path.rglob('*')
+                }
                 for depot_file in self.manifest:
                     #depot_file.chunks.sort(key=lambda x: x.offset)
+
                     posix_filename = Path(depot_file.filename).as_posix()
+                    all_paths.discard(posix_filename)
 
                     if compiled_pattern and not compiled_pattern.search(posix_filename):
                         continue
@@ -437,6 +485,7 @@ class DepotDownloader:
                             )
                             futures.append(future)
                         else:
+                            self.tqdm.set_postfix_str(posix_filename[-(shutil.get_terminal_size().columns // 4):], False)
                             self.tqdm.update(chunk.cb_original)
 
                 if sys.platform == 'win32':
@@ -465,12 +514,30 @@ class DepotDownloader:
                     with self.lock:
                         self.save_chunk_dict()
                     self.tqdm.close()
+
+                    end = ''
+                    if len(all_paths) != 0:
+                        for path in sorted(all_paths, key=lambda p: len(Path(p).parts), reverse=True):
+                            if self.delete_unmatched:
+                                path = self.save_path / path
+                                if path.is_symlink() or path.is_file():
+                                    path.unlink()
+                                elif path.is_dir():
+                                    path.rmdir()
+                            else:
+                                tqdm.write(path, end=" ")
+
+                        if not self.delete_unmatched:
+                            tqdm.write('')
+                            end = (f", Found {len(all_paths)} entries above in the output directory that are not in the manifest!")
+                        all_paths.clear()
+
                     elapsed = self.tqdm.format_dict["elapsed"]
-                    print(f'Depot {self.depot_id}:	completed in {elapsed:.2f}s')
+                    tqdm.write(f'Depot {self.depot_id}: completed in {elapsed:.2f}s', end=(end or "\n"))
             except KeyboardInterrupt:
                 executor.shutdown(wait=True, cancel_futures=True)
                 self.tqdm.close()
-                print(f'Depot {self.depot_id}:	cancelled')
+                tqdm.write(f'Depot {self.depot_id}: cancelled')
 
     def _handle_chunk_result(self, future:Future, chunk_key, chunk_size, path:str):
         if future.cancelled():
@@ -549,11 +616,11 @@ def main(new_args=None):
                     raise KeyboardInterrupt
                 d = DepotDownloader(manifest_path, depot_key, args.thread, save_path, server_set, args.level,
                                     args.retry, args.login_anonymously, args.max_servers, args.app_id,
-                                    args.use_websocket, args.cell_id)
+                                    args.use_websocket, args.cell_id, args.verify_integrity, args.delete_unmatched)
                 d.download(args.regex_pattern)
 
 if __name__ == '__main__':
     try:
         main()
     except KeyboardInterrupt:
-        print('All downloads cancelled')
+        tqdm.write('All downloads cancelled')
