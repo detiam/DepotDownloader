@@ -171,7 +171,6 @@ class FileDownload:
         with self.lock, self.path.open('rb+') as file:
             file.seek(chunk.offset, 0)
             file.write(data)
-            file.truncate(self.depot_file.size)
 
     def get_chunk(self, chunk_id, max_attempts=5):
         server, token = self.depot_downloader.get_content_server()
@@ -438,8 +437,6 @@ class DepotDownloader:
                             )
                             futures.append(future)
                         else:
-                            with file_downloader.path.open("rb+") as file:
-                                file.truncate(depot_file.size)
                             self.tqdm.update(chunk.cb_original)
 
                 if sys.platform == 'win32':
