@@ -1,4 +1,4 @@
 steam[client] @ git+https://github.com/detiam/steam_websocket.git@e00f4b547d1339a48195d2518845cccfa71ce669
-requests>=2.32
+requests[socks]>=2.32
 tqdm>=4.67
-pywin32>=311; sys_platform == 'win32'
+pip_system_certs>=5.3

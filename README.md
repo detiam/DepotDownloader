@@ -1,12 +1,8 @@
 # steam仓库清单文件下载
 
-## 全局参数
-
-* `-t, --thread-num`: 线程数(默认32)
-* `-o, --save-path`: 下载路径
-* `-s, --server`: 指定cdn下载,可指定多个或`,`分隔
-* `-l, --level`: 日志等级
-* `-r, --retry-num`: 重试次数(默认3)
+## 查看使用帮助
+* `python -m pip install -r requirements.txt`
+* `python main.py --help`  
 
 ## 子命令参数
 
@@ -53,3 +49,7 @@
 * steam导入旧清单无法下载
 * 使用本工具下载旧清单文件到steam游戏目录
 * 使用[steamtools](https://steamtools.net/)开启`阻止游戏下载与更新`，点击下载完空包即可游玩旧版本
+
+## free-threading 版本
+安装 free-threading 版本 Python 后使用 `PYTHON_GIL` 环境变量控制，应该可以提升性能
+* `PYTHON_GIL=0 python main.py --help`

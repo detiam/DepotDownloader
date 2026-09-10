@@ -3,12 +3,13 @@
 # requires-python = ">=3.14"
 # dependencies = [
 #   "steam[client] @ git+https://github.com/detiam/steam_websocket.git@e00f4b547d1339a48195d2518845cccfa71ce669",
-#   "requests>=2.32",
+#   "requests[socks]>=2.32",
 #   "tqdm>=4.67",
-#   "zstandard>=0.25",
-#   "pywin32>=311; sys_platform == 'win32'",
+#   "pip_system_certs>=5.3",
 # ]
 # ///
+
+import pip_system_certs.wrapt_requests; pip_system_certs.wrapt_requests.inject_truststore()
 
 import os
 import re
@@ -17,15 +18,14 @@ import vdf
 import time
 import lzma
 import json
-import signal
 import shutil
 import struct
 import logging
-import hashlib
 import argparse
 from tqdm import tqdm
 from io import BytesIO
 from pathlib import Path
+from hashlib import file_digest
 from binascii import crc32, unhexlify
 from zipfile import ZipFile
 from collections import deque
@@ -70,7 +70,7 @@ conn_group = parser.add_argument_group('connection options')
 conn_group.add_argument('-u', '--api-host', type=str, default='Public',
     help=f'available: {APIHost._member_names_} or a custom string')
 conn_group.add_argument('-s', '--server', type=str, dest='server_list', action='append', nargs='?',
-    help='content server list')
+    help='custom content server(cdn) list')
 conn_group.add_argument('-m', '--max-servers', type=int, default=20,
     help='how many content server can be obtained and used at most')
 conn_group.add_argument('--use-http', action='store_true',
@@ -111,15 +111,17 @@ from steam.core.manifest import DepotManifest, DepotFile
 from steam.core.crypto import symmetric_decrypt
 
 if sys.platform == 'win32':
+    from signal import signal, SIGINT, SIGTERM, SIGBREAK
+
     def _interrupt_handler(signum, frame):
         raise KeyboardInterrupt
 
     for sig in (
-        signal.SIGINT,
-        signal.SIGTERM,
-        signal.SIGBREAK,
+        SIGINT,
+        SIGTERM,
+        SIGBREAK,
     ):
-        signal.signal(sig, _interrupt_handler)
+        signal(sig, _interrupt_handler)
 else:
     import atexit
     import termios
@@ -149,8 +151,8 @@ class FileDownload:
         if depot_file.is_file:
             if self.file_path.exists():
                 if self.verify_integrity:
-                    self.log.debug(f"Verifying integrity of {self.file_path}...")
-                    if self.depot_file.size and hashlib.file_digest(self.file_path.open('rb'), 'sha1').digest() != self.depot_file.sha_content:
+                    self.log.debug(f"Verifying integrity of {filename}...")
+                    if self.depot_file.size and file_digest(self.file_path.open('rb'), 'sha1').digest() != self.depot_file.sha_content:
                         self.log.warning(f"File '{self.file_path}' exists but integrity check failed, redownloading.")
                         chunk_dict[filename.as_posix()] = []
 
@@ -193,6 +195,8 @@ class FileDownload:
 
     def download_chunk_and_save(self, chunk, max_attempts=5):
         chunk_id = chunk.sha.hex()
+        self.depot_downloader.tqdm.set_postfix_str(
+            self.file_path.as_posix()[-(shutil.get_terminal_size().columns // 4):])
         data = self.get_chunk(chunk_id, max_attempts)
         with self.lock, self.file_path.open('rb+') as file:
             file.seek(chunk.offset, 0)
@@ -456,7 +460,7 @@ class DepotDownloader:
             posix_filename = Path(depot_file.filename).as_posix()
             paths_in_dir.discard(posix_filename)
 
-    def download(self, pattern:str='', paths_in_dir:set[str]=set()) -> bool:
+    def download(self, pattern:str='', paths_in_dir:set[str]=set()):
         executor = ThreadPoolExecutor(max_workers=self.thread_num)
         try:
             compiled_pattern = re.compile(pattern)
@@ -467,12 +471,19 @@ class DepotDownloader:
                 posix_filename = Path(depot_file.filename).as_posix()
                 paths_in_dir.discard(posix_filename)
                 if pattern and not compiled_pattern.search(posix_filename): continue
+
+                if posix_filename in self.chunk_dict:
+                    self.tqdm.set_postfix_str(
+                        posix_filename[-(shutil.get_terminal_size().columns // 4):])
+
                 file_downloader = FileDownload(self, depot_file)
 
                 for chunk in depot_file.chunks:
                     chunk_key = f'{chunk.offset}_{chunk.sha.hex()}'
 
-                    if chunk_key not in self.chunk_dict.get(posix_filename, {}):
+                    if chunk_key in self.chunk_dict.get(posix_filename, {}):
+                        self.tqdm.update(chunk.cb_original)
+                    else:
                         future = executor.submit(
                             file_downloader.download_chunk_and_save,
                             chunk,
@@ -485,16 +496,12 @@ class DepotDownloader:
                         )
 
                         futures.append(future)
-                    else:
-                        self.tqdm.set_postfix_str(
-                            posix_filename[-(shutil.get_terminal_size().columns // 4):], False)
-                        self.tqdm.update(chunk.cb_original)
 
             for f in as_completed(futures):
                 _ = f.result()
         except KeyboardInterrupt:
             tqdm.write(f'Depot {self.depot_id}: cancelled')
-            return False
+            self.discard_paths_in_manifest(paths_in_dir)
         except Exception:
             tqdm.write(f'Depot {self.depot_id}: failed')
             raise
@@ -511,13 +518,9 @@ class DepotDownloader:
                 pass
             #time.sleep(1) # wait for another KeyboardInterrupt to cancell all download
 
-        return True
-
     def _handle_chunk_result(self, future:Future, chunk_key, chunk_size, path:str):
         if future.cancelled():
             return
-        self.tqdm.set_postfix_str(
-            path[-(shutil.get_terminal_size().columns // 4):], False)
         self.tqdm.update(chunk_size)
         with self.lock:
             self.chunk_dict[path].append(chunk_key)
@@ -612,9 +615,7 @@ def main(new_args=None):
                                         app_id=args.app_id,
                                         cell_id=args.cell_id,
                                         verify_integrity=args.verify_integrity)
-                    r = d.download(args.regex_pattern, paths_in_dir)
-                    if r == False:
-                        d.discard_paths_in_manifest(paths_in_dir)
+                    d.download(args.regex_pattern, paths_in_dir)
     except KeyboardInterrupt:
         tqdm.write('All downloads cancelled')
     else:
