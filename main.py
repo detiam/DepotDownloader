@@ -166,7 +166,7 @@ class FileDownload:
                     self.file_path.parent.mkdir(parents=True, exist_ok=True)
 
                 with self.file_path.open("wb") as file:
-                    if hasattr(os, 'posix_fallocate') and depot_file.size > 3:
+                    if hasattr(os, 'posix_fallocate') and depot_file.size >= 1024 ** 3:
                         os.posix_fallocate(file.fileno(), 0, depot_file.size)
                     else:
                         file.truncate(depot_file.size)
@@ -393,7 +393,7 @@ class DepotDownloader:
         return False
 
     def _get_chunk_saves(self):
-        matching_files = [p for p in Path.cwd().glob(f'*% - {self.depot_id}.json') if p.is_file()]
+        matching_files = [p for p in Path.cwd().glob(f'{self.depot_id} - *%.json') if p.is_file()]
         matching_files.sort(key=lambda x: x.stat().st_mtime)
         chunk_saves = None
         if matching_files:
@@ -402,7 +402,7 @@ class DepotDownloader:
                 file.unlink()
 
         if not chunk_saves:
-            chunk_saves = Path(f'0% - {self.depot_id}.json')
+            chunk_saves = Path(f'{self.depot_id} - 0%.json')
             chunk_saves.touch()
 
         return chunk_saves
@@ -525,16 +525,20 @@ class DepotDownloader:
         with self.lock:
             self.chunk_dict[path].append(chunk_key)
             percentage = int(round(self.tqdm.n / self.tqdm.total * 100))
-            new_name = f'{percentage}% - {self.depot_id}.json'
+            new_name = f"{self.depot_id} - {percentage}%.json"
             if self.chunk_dict_path.name != new_name:
                 self.save_chunk_dict()
                 self.chunk_dict_path = self.chunk_dict_path.replace(
                     self.chunk_dict_path.with_name(new_name))
 
     def save_chunk_dict(self):
-        chunk_dict_for_save = self.chunk_dict.copy()
-        with self.chunk_dict_path.open('r+', encoding='utf-8') as f:
-            json.dump(chunk_dict_for_save, f)
+        try:
+            chunk_dict_for_save = self.chunk_dict.copy()
+            with self.chunk_dict_path.open('r+', encoding='utf-8') as f:
+                json.dump(chunk_dict_for_save, f)
+                f.truncate()
+        except KeyboardInterrupt:
+            pass
 
 def get_manifest_path_depot_key_dict(path):
     path = Path(path)
