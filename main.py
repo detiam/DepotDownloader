@@ -17,6 +17,7 @@ import vdf
 import time
 import lzma
 import json
+import signal
 import shutil
 import struct
 import logging
@@ -28,10 +29,11 @@ from pathlib import Path
 from binascii import crc32, unhexlify
 from zipfile import ZipFile
 from collections import deque
+from collections.abc import Iterable
 from threading import RLock as Lock
 from urllib3.util import parse_url
 from requests.adapters import HTTPAdapter
-from concurrent.futures import ThreadPoolExecutor, Future, wait
+from concurrent.futures import ThreadPoolExecutor, Future, as_completed
 from compression.zstd import decompress as ZSTD_uncompress
 
 from steam.utils.web import make_requests_session, APIHost, DEFAULT_PARAMS
@@ -39,7 +41,7 @@ from steam.utils.web import make_requests_session, APIHost, DEFAULT_PARAMS
 parser = argparse.ArgumentParser(
     add_help=True,
     description='Depot Downloader, write in Python.',
-    epilog='Use Ctrl+C to cancel the download, double-tap to cancel all downloads.')
+    epilog=f"Use Ctrl+C to cancel the download, double-tap to cancel all downloads. GIL: {sys._is_gil_enabled()}")
 
 parser.add_argument('-r', '--retry', type=int, default=5,
     help='how many retries for downloading a chunk, default 5')
@@ -51,7 +53,7 @@ parser.add_argument('-o', '--output', type=str,
     help='output directory to save the downloaded files')
 parser.add_argument('-d', '--delete', action='store_true', dest='delete_unmatched',
     help='delete files that are in the output directory but not in the manifest')
-parser.add_argument('-p', '--pattern', type=str, dest='regex_pattern',
+parser.add_argument('-p', '--pattern', type=str, dest='regex_pattern', default='',
     help='regex pattern to match the file path, only matched files will be downloaded')
 parser.add_argument('-log', '--level', type=str, default='INFO',
     help=f'available: {list(logging._levelToName.values())}')
@@ -108,22 +110,17 @@ from steam.core.connection import WebsocketConnection
 from steam.core.manifest import DepotManifest, DepotFile
 from steam.core.crypto import symmetric_decrypt
 
-_win_exit_flag=False
 if sys.platform == 'win32':
-    from win32api import SetConsoleCtrlHandler
-    from win32con import CTRL_BREAK_EVENT
-    def _win_interrupt_handler(dwCtrlType):
-        global _win_exit_flag
-        if dwCtrlType != CTRL_BREAK_EVENT:
-            _unregister()
-            _win_exit_flag = True
-            return 1
-        return 0
-    def _unregister():
-        SetConsoleCtrlHandler(_win_interrupt_handler, 0)
-    SetConsoleCtrlHandler(_win_interrupt_handler, 1)
+    def _interrupt_handler(signum, frame):
+        raise KeyboardInterrupt
 
-if sys.platform != "win32":
+    for sig in (
+        signal.SIGINT,
+        signal.SIGTERM,
+        signal.SIGBREAK,
+    ):
+        signal.signal(sig, _interrupt_handler)
+else:
     import atexit
     import termios
 
@@ -336,26 +333,30 @@ class TqdmLoggingHandler(logging.Handler):
         tqdm.write(msg)
 
 class DepotDownloader:
-    def __init__(self, manifest_path, depot_key, thread_num=32, save_path=None, servers=None,
-                 level=logging.INFO, retry_num=5, expect_logged_in=False, max_servers=20, appid=0,
-                 use_websocket=False, cellid=0, verify_integrity=False, delete_unmatched=False):
-        self._win_exit_flag = False
+    def __init__(self, manifest_path, depot_key, *,
+                 app_id=0,
+                 cell_id=0,
+                 thread_num=32,
+                 retry_num=5,
+                 max_servers=20,
+                 cdn_client:CDNClient=None,
+                 custom_servers:Iterable[str]=[],
+                 save_path:str=None,
+                 verify_integrity=False,
+                 level=logging.INFO,):
+
         self.lock = Lock()
-        self.expect_logged_in = expect_logged_in
-        self.verify_integrity = verify_integrity
-        self.delete_unmatched = delete_unmatched
-        if expect_logged_in:
-            self.client = SteamClient()
-            if use_websocket:
-                self.client.connection = WebsocketConnection()
-            result = self.client.anonymous_login()
-            if result != EResult.OK:
-                raise SteamError(f'Login failure reason: {result.__repr__()}')
-            self.cdn = CDNClient(self.client)
         self.manifest_path = manifest_path
+        with open(self.manifest_path, 'rb') as f:
+            content = f.read()
+        self.manifest = DepotManifest(content)
+        self.depot_id = self.manifest.depot_id
         self.depot_key = unhexlify(depot_key)
-        self.appid = appid
-        self.cellid = cellid
+        self.manifest.decrypt_filenames(self.depot_key)
+        self.verify_integrity = verify_integrity
+        self.cdn = cdn_client
+        self.app_id = app_id
+        self.cell_id = cell_id
         self.retry_num = retry_num
         self.thread_num = int(thread_num)
         self.max_servers = int(max_servers)
@@ -363,11 +364,6 @@ class DepotDownloader:
         logging.basicConfig(format='%(levelname)s: %(message)s',
                             level=level,
                             handlers=[TqdmLoggingHandler()])
-        with open(self.manifest_path, 'rb') as f:
-            content = f.read()
-        self.manifest = DepotManifest(content)
-        self.manifest.decrypt_filenames(self.depot_key)
-        self.depot_id = self.manifest.depot_id
         self.chunk_dict_path = self._get_chunk_saves()
         self.save_path = Path(save_path) if save_path else Path(str(self.depot_id))
         try:
@@ -381,12 +377,16 @@ class DepotDownloader:
         self.web.mount('http://', adapters)
         self.web.mount('https://', adapters)
         self.servers = SingletonDeque()
-        self.num_entries_in_client_list = 0 # num of how many cdn auth token server can be used
-        self.get_content_server(servers, fetch_all_cdn_token=True)
+        self.num_entries_in_client_list = 0 # num of how many cdn auth token server can be used, unused for now
+        self.get_content_server(fetch_all_cdn_token=True, custom_servers=custom_servers)
         self.tqdm = tqdm(
             total=self.manifest.size_original,
             desc=f'Depot {self.depot_id}',
             unit='B', unit_scale=True, leave=False)
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.tqdm.close()
+        return False
 
     def _get_chunk_saves(self):
         matching_files = [p for p in Path.cwd().glob(f'*% - {self.depot_id}.json') if p.is_file()]
@@ -403,16 +403,16 @@ class DepotDownloader:
 
         return chunk_saves
 
-    def get_content_server(self, servers=None, rotate=False, cell_id=0, fetch_all_cdn_token=False):
-        if servers:
-            for server_str in map(str, servers):
+    def get_content_server(self, rotate=False, fetch_all_cdn_token=False, cell_id=0, custom_servers:Iterable[str]=[]):
+        if custom_servers:
+            for server_str in map(str, custom_servers):
                 if server_str not in self.servers:
                     self.servers.append(server_str)
 
         if not self.servers:
             try:
                 resp = webapi_get('IContentServerDirectoryService', 'GetServersForSteamPipe',
-                                  params={'cell_id': cell_id or self.cellid, 'max_servers': self.max_servers})
+                                  params={'cell_id': cell_id or self.cell_id, 'max_servers': self.max_servers})
                 content_servers = resp['response']['servers']
                 content_servers.sort(key=lambda x: (x['type'] != 'CDN', x['priority_class']))
             except Exception:
@@ -435,12 +435,12 @@ class DepotDownloader:
             self.servers.rotate(-1)
 
         server_str, token = self.servers[0], ''
-        if self.expect_logged_in:
+        if self.cdn is not None:
             if fetch_all_cdn_token:
                 for server in self.servers:
-                    self.cdn.get_cdn_auth_token(self.appid, self.depot_id, parse_url(server).host)
+                    self.cdn.get_cdn_auth_token(self.app_id, self.depot_id, parse_url(server).host)
             while True:
-                result:dict = self.cdn.get_cdn_auth_token(self.appid, self.depot_id, parse_url(server_str).host)
+                result:dict = self.cdn.get_cdn_auth_token(self.app_id, self.depot_id, parse_url(server_str).host)
                 if result['eresult'] in (EResult.OK, EResult.Fail): # Fail means token unneeded seems
                     token = result['token']
                     break
@@ -451,99 +451,73 @@ class DepotDownloader:
 
         return server_str, token
 
-    def download(self, pattern:str=''):
-        compiled_pattern = re.compile(pattern) if pattern else None
-        with ThreadPoolExecutor(max_workers=self.thread_num) as executor:
+    def discard_paths_in_manifest(self, paths_in_dir:set[str]=set()):
+        for depot_file in self.manifest:
+            posix_filename = Path(depot_file.filename).as_posix()
+            paths_in_dir.discard(posix_filename)
+
+    def download(self, pattern:str='', paths_in_dir:set[str]=set()) -> bool:
+        executor = ThreadPoolExecutor(max_workers=self.thread_num)
+        try:
+            compiled_pattern = re.compile(pattern)
             futures:list[Future] = []
+
+            for depot_file in self.manifest:
+                #depot_file.chunks.sort(key=lambda x: x.offset)
+                posix_filename = Path(depot_file.filename).as_posix()
+                paths_in_dir.discard(posix_filename)
+                if pattern and not compiled_pattern.search(posix_filename): continue
+                file_downloader = FileDownload(self, depot_file)
+
+                for chunk in depot_file.chunks:
+                    chunk_key = f'{chunk.offset}_{chunk.sha.hex()}'
+
+                    if chunk_key not in self.chunk_dict.get(posix_filename, {}):
+                        future = executor.submit(
+                            file_downloader.download_chunk_and_save,
+                            chunk,
+                            self.retry_num
+                        )
+
+                        future.add_done_callback(
+                            lambda f, ck=chunk_key, cb=chunk.cb_original, path=posix_filename:
+                                self._handle_chunk_result(f, ck, cb, path)
+                        )
+
+                        futures.append(future)
+                    else:
+                        self.tqdm.set_postfix_str(
+                            posix_filename[-(shutil.get_terminal_size().columns // 4):], False)
+                        self.tqdm.update(chunk.cb_original)
+
+            for f in as_completed(futures):
+                _ = f.result()
+        except KeyboardInterrupt:
+            tqdm.write(f'Depot {self.depot_id}: cancelled')
+            return False
+        except Exception:
+            tqdm.write(f'Depot {self.depot_id}: failed')
+            raise
+        else:
+            elapsed = self.tqdm.format_dict["elapsed"]
+            tqdm.write(f'Depot {self.depot_id}: completed in {elapsed:.2f}s')
+        finally:
             try:
-                all_paths = {
-                    f.relative_to(self.save_path).as_posix()
-                    for f in self.save_path.rglob('*')
-                }
-                for depot_file in self.manifest:
-                    #depot_file.chunks.sort(key=lambda x: x.offset)
-
-                    posix_filename = Path(depot_file.filename).as_posix()
-                    all_paths.discard(posix_filename)
-
-                    if compiled_pattern and not compiled_pattern.search(posix_filename):
-                        continue
-
-                    file_downloader = FileDownload(self, depot_file)
-
-                    for chunk in depot_file.chunks:
-                        chunk_key = f'{chunk.offset}_{chunk.sha.hex()}'
-
-                        if chunk_key not in self.chunk_dict.get(posix_filename, {}):
-                            future = executor.submit(
-                                file_downloader.download_chunk_and_save,
-                                chunk,
-                                self.retry_num
-                            )
-                            future.add_done_callback(
-                                lambda f, ck=chunk_key, cb=chunk.cb_original, path=posix_filename: self._handle_chunk_result(f, ck, cb, path)
-                            )
-                            futures.append(future)
-                        else:
-                            self.tqdm.set_postfix_str(posix_filename[-(shutil.get_terminal_size().columns // 4):], False)
-                            self.tqdm.update(chunk.cb_original)
-
-                if sys.platform == 'win32':
-                    from win32api import SetConsoleCtrlHandler
-                    from win32con import CTRL_BREAK_EVENT
-                    def _win_interrupt_handler(dwCtrlType):
-                        if dwCtrlType != CTRL_BREAK_EVENT:
-                            _unregister()
-                            for f in futures:
-                                f.cancel()
-                            self._win_exit_flag = True
-                            return 1
-                        return 0
-                    def _unregister():
-                        SetConsoleCtrlHandler(_win_interrupt_handler, 0)
-                    SetConsoleCtrlHandler(_win_interrupt_handler, 1)
-
-                _, not_done = wait(futures, return_when='FIRST_EXCEPTION')
-                if self._win_exit_flag:
-                    raise KeyboardInterrupt
-                if not_done:
-                    executor.shutdown(wait=True, cancel_futures=True)
-                    self.tqdm.close()
-                    os._exit(1)
-                else:
-                    with self.lock:
-                        self.save_chunk_dict()
-                    self.tqdm.close()
-
-                    end = ''
-                    if len(all_paths) != 0:
-                        for path in sorted(all_paths, key=lambda p: len(Path(p).parts), reverse=True):
-                            if self.delete_unmatched:
-                                path = self.save_path / path
-                                if path.is_symlink() or path.is_file():
-                                    path.unlink()
-                                elif path.is_dir():
-                                    path.rmdir()
-                            else:
-                                tqdm.write(path, end=" ")
-
-                        if not self.delete_unmatched:
-                            tqdm.write('')
-                            end = (f", Found {len(all_paths)} entries above in the output directory that are not in the manifest!")
-                        all_paths.clear()
-
-                    elapsed = self.tqdm.format_dict["elapsed"]
-                    tqdm.write(f'Depot {self.depot_id}: completed in {elapsed:.2f}s', end=(end or "\n"))
+                executor.shutdown(cancel_futures=True)
+                self.tqdm.clear()
+                with self.lock:
+                    self.save_chunk_dict()
             except KeyboardInterrupt:
-                executor.shutdown(wait=True, cancel_futures=True)
-                self.tqdm.close()
-                tqdm.write(f'Depot {self.depot_id}: cancelled')
+                pass
+            #time.sleep(1) # wait for another KeyboardInterrupt to cancell all download
+
+        return True
 
     def _handle_chunk_result(self, future:Future, chunk_key, chunk_size, path:str):
         if future.cancelled():
             return
-        #future.result()
-        self.tqdm.set_postfix_str(path[-(shutil.get_terminal_size().columns // 4):], False)
+        self.tqdm.set_postfix_str(
+            path[-(shutil.get_terminal_size().columns // 4):], False)
         self.tqdm.update(chunk_size)
         with self.lock:
             self.chunk_dict[path].append(chunk_key)
@@ -551,8 +525,8 @@ class DepotDownloader:
             new_name = f'{percentage}% - {self.depot_id}.json'
             if self.chunk_dict_path.name != new_name:
                 self.save_chunk_dict()
-                self.chunk_dict_path = self.chunk_dict_path.replace(self.chunk_dict_path.with_name(new_name))
-
+                self.chunk_dict_path = self.chunk_dict_path.replace(
+                    self.chunk_dict_path.with_name(new_name))
 
     def save_chunk_dict(self):
         chunk_dict_for_save = self.chunk_dict.copy()
@@ -597,7 +571,7 @@ def main(new_args=None):
     if new_args:
         args = parser.parse_args(new_args)
     manifest_path_depot_key_dict = {}
-    save_path = args.output
+    save_path = Path(args.output)
     if args.command == 'app':
         manifest_path_depot_key_dict = get_manifest_path_depot_key_dict(args.app_path)
         if manifest_path_depot_key_dict and args.app_path and not save_path:
@@ -609,18 +583,61 @@ def main(new_args=None):
         for server in args.server_list:
             if type(server) == str:
                 server_set.update(server.split(','))
-    if manifest_path_depot_key_dict:
-        for manifest_path, depot_key in manifest_path_depot_key_dict.items():
-            if manifest_path and depot_key:
-                if _win_exit_flag:
-                    raise KeyboardInterrupt
-                d = DepotDownloader(manifest_path, depot_key, args.thread, save_path, server_set, args.level,
-                                    args.retry, args.login_anonymously, args.max_servers, args.app_id,
-                                    args.use_websocket, args.cell_id, args.verify_integrity, args.delete_unmatched)
-                d.download(args.regex_pattern)
 
-if __name__ == '__main__':
     try:
-        main()
+        if manifest_path_depot_key_dict:
+            cdn = None
+            if args.login_anonymously:
+                client = SteamClient()
+                if args.use_websocket:
+                    client.connection = WebsocketConnection()
+                result = client.anonymous_login()
+                if result != EResult.OK:
+                    raise SteamError(f'Login failure reason: {result.__repr__()}')
+                cdn = CDNClient(client)
+            paths_in_dir = {
+                f.relative_to(save_path).as_posix()
+                for f in save_path.rglob('*')
+            }
+            for manifest_path, depot_key in manifest_path_depot_key_dict.items():
+                if manifest_path and depot_key:
+                    d = DepotDownloader(manifest_path, depot_key,
+                                        cdn_client=cdn,
+                                        thread_num=args.thread,
+                                        save_path=save_path,
+                                        custom_servers=server_set,
+                                        level=args.level,
+                                        retry_num=args.retry,
+                                        max_servers=args.max_servers,
+                                        app_id=args.app_id,
+                                        cell_id=args.cell_id,
+                                        verify_integrity=args.verify_integrity)
+                    r = d.download(args.regex_pattern, paths_in_dir)
+                    if r == False:
+                        d.discard_paths_in_manifest(paths_in_dir)
     except KeyboardInterrupt:
         tqdm.write('All downloads cancelled')
+    else:
+        # show extra files that are not in the manifest
+        end = ''
+        if not args.regex_pattern and len(paths_in_dir) != 0:
+            tqdm.write('') # for \n
+            for path in sorted(paths_in_dir, key=lambda p: len(Path(p).parts), reverse=True):
+                if args.delete_unmatched:
+                    path = save_path / path
+                    if path.is_symlink() or path.is_file():
+                        path.unlink()
+                    elif path.is_dir():
+                        path.rmdir()
+                else:
+                    tqdm.write(path, end=" ")
+
+            if not args.delete_unmatched:
+                tqdm.write('\n') # for \n
+                end = (f", Found {len(paths_in_dir)} entries above in the output directory that are not in the manifest!\n")
+
+        tqdm.write(f'All downloads completed', end=(end or "\n"))
+        return
+
+if __name__ == '__main__':
+    main()

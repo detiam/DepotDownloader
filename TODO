@@ -1,0 +1,2 @@
+FileDownload 和 DepotDownload 分离，用steam[client]里的
+get_chunk get_content_server SingletonDeque rtotate
