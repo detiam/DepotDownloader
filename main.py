@@ -62,7 +62,7 @@ auth_group = parser.add_argument_group('authentication options')
 auth_group.add_argument('-l', '--login-anonymously', action='store_true',
     help='required for request cdn auth token')
 auth_group.add_argument('-a', '--app-id', type=int, default=0,
-    help='optional for request cdn auth token')
+    help='optional for request cdn auth token, generate default output directory path')
 auth_group.add_argument('-c', '--cell-id', type=int, default=0,
     help='the overridden CellID of the content server to download from')
 
@@ -70,7 +70,7 @@ conn_group = parser.add_argument_group('connection options')
 conn_group.add_argument('-u', '--api-host', type=str, default='Public',
     help=f'available: {APIHost._member_names_} or a custom string')
 conn_group.add_argument('-s', '--server', type=str, dest='server_list', action='append', nargs='?',
-    help='custom content server(cdn) list')
+    help='custom content server(cdn) list, can be set multiple times or separated by commas(,)')
 conn_group.add_argument('-m', '--max-servers', type=int, default=20,
     help='how many content server can be obtained and used at most')
 conn_group.add_argument('--use-http', action='store_true',
@@ -138,9 +138,8 @@ else:
 class FileDownload:
     def __init__(self, depot_downloader:DepotDownloader, depot_file:DepotFile, save_path=None):
         self.depot_downloader = depot_downloader
-        self.verify_integrity = self.depot_downloader.verify_integrity
+        verify_integrity = self.depot_downloader.verify_integrity
         chunk_dict = self.depot_downloader.chunk_dict
-        self.depot_key = self.depot_downloader.depot_key
         self.log = self.depot_downloader.log
         self.depot_file = depot_file
         self.depot_id = self.depot_file.manifest.depot_id
@@ -150,9 +149,9 @@ class FileDownload:
 
         if depot_file.is_file:
             if self.file_path.exists():
-                if self.verify_integrity:
+                if verify_integrity:
                     self.log.debug(f"Verifying integrity of {filename}...")
-                    if self.depot_file.size and file_digest(self.file_path.open('rb'), 'sha1').digest() != self.depot_file.sha_content:
+                    if depot_file.size and file_digest(self.file_path.open('rb'), 'sha1').digest() != depot_file.sha_content:
                         self.log.warning(f"File '{self.file_path}' exists but integrity check failed, redownloading.")
                         chunk_dict[filename.as_posix()] = []
 
@@ -211,7 +210,7 @@ class FileDownload:
                 resp = self.depot_downloader.web.get(url, timeout=10)
 
                 if resp.ok:
-                    data = symmetric_decrypt(resp.content, self.depot_key)
+                    data = symmetric_decrypt(resp.content, self.depot_downloader.depot_key)
 
                     if data[:2] == b'VZ':
                         if data[-2:] != b'zv':
@@ -337,7 +336,7 @@ class TqdmLoggingHandler(logging.Handler):
         tqdm.write(msg)
 
 class DepotDownloader:
-    def __init__(self, manifest_path, depot_key, *,
+    def __init__(self, manifest: DepotManifest, depot_key: bytes, *,
                  app_id=0,
                  cell_id=0,
                  thread_num=32,
@@ -345,17 +344,14 @@ class DepotDownloader:
                  max_servers=20,
                  cdn_client:CDNClient=None,
                  custom_servers:Iterable[str]=[],
-                 save_path:str=None,
+                 save_path:os.PathLike=None,
                  verify_integrity=False,
-                 level=logging.INFO,):
+                 level=logging.INFO):
 
         self.lock = Lock()
-        self.manifest_path = manifest_path
-        with open(self.manifest_path, 'rb') as f:
-            content = f.read()
-        self.manifest = DepotManifest(content)
+        self.manifest = manifest
         self.depot_id = self.manifest.depot_id
-        self.depot_key = unhexlify(depot_key)
+        self.depot_key = depot_key
         self.manifest.decrypt_filenames(self.depot_key)
         self.verify_integrity = verify_integrity
         self.cdn = cdn_client
@@ -388,9 +384,16 @@ class DepotDownloader:
             desc=f'Depot {self.depot_id}',
             unit='B', unit_scale=True, leave=False)
 
+    def __enter__(self):
+        return self
+
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.tqdm.close()
+        self.close()
         return False
+
+    def close(self):
+        self.tqdm.close()
+        self.web.close()
 
     def _get_chunk_saves(self):
         matching_files = [p for p in Path.cwd().glob(f'{self.depot_id} - *%.json') if p.is_file()]
@@ -540,86 +543,83 @@ class DepotDownloader:
         except KeyboardInterrupt:
             pass
 
-def get_manifest_path_depot_key_dict(path):
-    path = Path(path)
+def app_path_parser(app_path:os.PathLike) -> tuple[list[DepotManifest], dict[int,bytes]]:
+    path = Path(app_path)
     if not path.is_dir():
         raise NotADirectoryError(path)
-    manifest_path_list = []
-    depot_dict = {}
+    manifests:list[DepotManifest] = []
+    depot_keys:dict[int,bytes] = {}
     for file in path.iterdir():
         if file.is_file():
             if file.suffix == '.manifest':
-                manifest_path_list.append(file)
+                manifests.append(DepotManifest(file.read_bytes()))
             elif file.suffix == '.vdf':
                 with file.open() as f:
                     d = vdf.load(f)
-                depots = d.get('depots')
-                if not depots:
-                    return {}
+                depots = d['depots']
                 for depot_id in depots:
-                    depot_key = depots[depot_id].get('DecryptionKey')
-                    if not depot_key:
-                        continue
-                    depot_dict[int(depot_id)] = depot_key
-    manifest_path_depot_key_dict = {}
-    for manifest_path in manifest_path_list:
-        with manifest_path.open('rb') as f:
-            content = f.read()
-        manifest = DepotManifest(content)
-        if manifest.depot_id not in depot_dict:
-            continue
-        depot_key = depot_dict[manifest.depot_id]
-        manifest_path_depot_key_dict[manifest_path] = depot_key
-    return manifest_path_depot_key_dict
+                    depot_key = depots[depot_id]['DecryptionKey']
+                    depot_keys[int(depot_id)] = unhexlify(depot_key)
+
+    return manifests,depot_keys
 
 
 def main(new_args=None):
     global args
     if new_args:
         args = parser.parse_args(new_args)
-    manifest_path_depot_key_dict = {}
-    save_path = Path(args.output)
-    if args.command == 'app':
-        manifest_path_depot_key_dict = get_manifest_path_depot_key_dict(args.app_path)
-        if manifest_path_depot_key_dict and args.app_path and not save_path:
-            save_path = Path().absolute() / Path(args.app_path).name
-    elif args.command == 'depot':
-        manifest_path_depot_key_dict = dict(zip(args.manifest_path_list, args.depot_key_list))
+    paths_in_dir:set[str] = None
+    manifests:list[DepotManifest] = []
+    depot_keys:dict[int,bytes] = {}
+    save_path = Path(args.output) if args.output else None
     server_set = set()
     if args.server_list:
         for server in args.server_list:
-            if type(server) == str:
-                server_set.update(server.split(','))
+            server_set.update(server.split(','))
+
+    if args.command == 'app':
+        manifests, depot_keys = app_path_parser(args.app_path)
+        if not save_path:
+            save_path = Path() / (str(args.app_id) if args.app_id else Path(args.app_path).name)
+    elif args.command == 'depot':
+        for manifest_path, depot_key in zip(args.manifest_path_list, args.depot_key_list):
+            manifest = DepotManifest(Path(manifest_path).read_bytes())
+            manifests.append(manifest)
+            depot_keys[manifest.depot_id] = unhexlify(depot_key)
 
     try:
-        if manifest_path_depot_key_dict:
-            cdn = None
-            if args.login_anonymously:
-                client = SteamClient()
-                if args.use_websocket:
-                    client.connection = WebsocketConnection()
-                result = client.anonymous_login()
-                if result != EResult.OK:
-                    raise SteamError(f'Login failure reason: {result.__repr__()}')
-                cdn = CDNClient(client)
-            paths_in_dir = {
-                f.relative_to(save_path).as_posix()
-                for f in save_path.rglob('*')
-            }
-            for manifest_path, depot_key in manifest_path_depot_key_dict.items():
-                if manifest_path and depot_key:
-                    d = DepotDownloader(manifest_path, depot_key,
-                                        cdn_client=cdn,
-                                        thread_num=args.thread,
-                                        save_path=save_path,
-                                        custom_servers=server_set,
-                                        level=args.level,
-                                        retry_num=args.retry,
-                                        max_servers=args.max_servers,
-                                        app_id=args.app_id,
-                                        cell_id=args.cell_id,
-                                        verify_integrity=args.verify_integrity)
-                    d.download(args.regex_pattern, paths_in_dir)
+        cdn = None
+        if args.login_anonymously:
+            client = SteamClient()
+            if args.use_websocket:
+                client.connection = WebsocketConnection()
+            result = client.anonymous_login()
+            if result != EResult.OK:
+                raise SteamError(f'Login failure reason: {result.__repr__()}')
+            cdn = CDNClient(client)
+
+        for manifest in manifests:
+            depot_key = depot_keys[manifest.depot_id]
+            if not save_path:
+                save_path = Path(str(manifest.depot_id))
+            if not paths_in_dir:
+                paths_in_dir = {
+                    f.relative_to(save_path).as_posix()
+                    for f in save_path.rglob('*')
+                }
+            with DepotDownloader(
+                manifest, depot_key,
+                cdn_client=cdn,
+                thread_num=args.thread,
+                save_path=save_path,
+                custom_servers=server_set,
+                level=args.level,
+                retry_num=args.retry,
+                max_servers=args.max_servers,
+                app_id=args.app_id,
+                cell_id=args.cell_id,
+                verify_integrity=args.verify_integrity) as d:
+                d.download(args.regex_pattern, paths_in_dir)
     except KeyboardInterrupt:
         tqdm.write('All downloads cancelled')
     else:
