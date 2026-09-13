@@ -50,7 +50,7 @@ parser.add_argument('-t', '--thread', type=int, default=32,
 parser.add_argument('-i', '--integrity', action='store_true', dest='verify_integrity',
     help='verify the integrity of downloaded files')
 parser.add_argument('-o', '--output', type=str,
-    help='output directory to save the downloaded files')
+    help='where the downloaded file is saved, default to the directory named with app/depot id in the current directory')
 parser.add_argument('-d', '--delete', action='store_true', dest='delete_unmatched',
     help='delete files that are in the output directory but not in the manifest')
 parser.add_argument('-p', '--pattern', type=str, dest='regex_pattern', default='',
@@ -62,7 +62,7 @@ auth_group = parser.add_argument_group('authentication options')
 auth_group.add_argument('-l', '--login-anonymously', action='store_true',
     help='required for request cdn auth token')
 auth_group.add_argument('-a', '--app-id', type=int, default=0,
-    help='optional for request cdn auth token, generate default output directory path')
+    help='optional for request cdn auth token, and for the default output directory name')
 auth_group.add_argument('-c', '--cell-id', type=int, default=0,
     help='the overridden CellID of the content server to download from')
 
@@ -505,14 +505,14 @@ class DepotDownloader:
             for f in as_completed(futures):
                 _ = f.result()
         except KeyboardInterrupt:
-            tqdm.write(f'Depot {self.depot_id}: cancelled')
+            tqdm.write(f'Depot {self.depot_id}: cancelled; this needs up to 10 seconds for all connections to close.')
             self.discard_paths_in_manifest(paths_in_dir)
         except Exception:
             tqdm.write(f'Depot {self.depot_id}: failed')
             raise
         else:
             elapsed = self.tqdm.format_dict["elapsed"]
-            tqdm.write(f'Depot {self.depot_id}: completed in {elapsed:.2f}s')
+            tqdm.write(f'Depot {self.depot_id}: completed in {elapsed:.2f}s; saved to "{self.save_path.absolute().as_uri()}"')
         finally:
             try:
                 executor.shutdown(cancel_futures=True)
@@ -545,106 +545,111 @@ class DepotDownloader:
         except KeyboardInterrupt:
             pass
 
-def app_path_parser(app_path:os.PathLike) -> tuple[list[DepotManifest], dict[int,bytes]]:
-    path = Path(app_path)
-    if not path.is_dir():
-        raise NotADirectoryError(path)
-    manifests:list[DepotManifest] = []
-    depot_keys:dict[int,bytes] = {}
-    for file in path.iterdir():
-        if file.is_file():
-            if file.suffix == '.manifest':
-                manifests.append(DepotManifest(file.read_bytes()))
-            elif file.suffix == '.vdf':
-                with file.open() as f:
-                    d = vdf.load(f)
-                depots = d['depots']
-                for depot_id in depots:
-                    depot_key = depots[depot_id]['DecryptionKey']
-                    depot_keys[int(depot_id)] = unhexlify(depot_key)
-
-    return manifests,depot_keys
-
-
 def main(new_args=None):
     global args
     if new_args:
         args = parser.parse_args(new_args)
-    paths_in_dir:set[str] = set()
+
     manifests:list[DepotManifest] = []
     depot_keys:dict[int,bytes] = {}
-    save_path = Path(args.output) if args.output else None
-    server_set = set()
-    if args.server_list:
-        for server in args.server_list:
-            server_set.update(server.split(','))
+
+    separate_save_path = False
+    paths_in_dir:set[str] = set()
+    save_path = Path(args.output) if args.output else Path() / str(args.app_id) if args.app_id else None
+    if save_path is None:
+        separate_save_path = True
+    else:
+        paths_in_dir = {
+            f.relative_to(save_path).as_posix()
+            for f in save_path.rglob('*')
+        }
 
     if args.command == 'app':
-        manifests, depot_keys = app_path_parser(args.app_path)
-        if not save_path:
-            save_path = Path() / (str(args.app_id) if args.app_id else Path(args.app_path).name)
+        path = Path(args.app_path)
+        if not path.is_dir():
+            raise NotADirectoryError(path)
+        for file in path.iterdir():
+            if file.is_file():
+                if file.suffix == '.manifest':
+                    manifests.append(DepotManifest(file.read_bytes()))
+                elif file.suffix == '.vdf':
+                    with file.open() as f:
+                        d = vdf.load(f)
+                    depots = d['depots']
+                    for depot_id in depots:
+                        depot_key = depots[depot_id]['DecryptionKey']
+                        depot_keys[int(depot_id)] = unhexlify(depot_key)
     elif args.command == 'depot':
         for manifest_path, depot_key in zip(args.manifest_path_list, args.depot_key_list):
             manifest = DepotManifest(Path(manifest_path).read_bytes())
             manifests.append(manifest)
             depot_keys[manifest.depot_id] = unhexlify(depot_key)
 
-    try:
-        cdn = None
-        if args.login_anonymously:
-            client = SteamClient()
-            if args.use_websocket:
-                client.connection = WebsocketConnection()
-            result = client.anonymous_login()
-            if result != EResult.OK:
-                raise SteamError(f'Login failure reason: {result.__repr__()}')
-            cdn = CDNClient(client)
+    server_set = set()
+    if args.server_list:
+        for server in args.server_list:
+            server_set.update(server.split(','))
 
-        for manifest in manifests:
-            depot_key = depot_keys[manifest.depot_id]
-            if not save_path:
-                save_path = Path(str(manifest.depot_id))
-            if not paths_in_dir:
-                paths_in_dir = {
-                    f.relative_to(save_path).as_posix()
-                    for f in save_path.rglob('*')
-                }
-            with DepotDownloader(
-                manifest, depot_key,
-                cdn_client=cdn,
-                thread_num=args.thread,
-                save_path=save_path,
-                custom_servers=server_set,
-                level=args.level,
-                retry_num=args.retry,
-                max_servers=args.max_servers,
-                app_id=args.app_id,
-                cell_id=args.cell_id,
-                verify_integrity=args.verify_integrity) as d:
-                d.download(args.regex_pattern, paths_in_dir)
-    except KeyboardInterrupt:
-        tqdm.write('All downloads cancelled')
-    else:
-        # show extra files that are not in the manifest
-        end = ''
-        if not args.regex_pattern and len(paths_in_dir) != 0:
-            tqdm.write('') # for \n
-            for path in sorted(paths_in_dir, key=lambda p: len(Path(p).parts), reverse=True):
+    cdn = None
+    if args.login_anonymously:
+        client = SteamClient()
+        if args.use_websocket:
+            client.connection = WebsocketConnection()
+        result = client.anonymous_login()
+        if result != EResult.OK:
+            raise SteamError(f'Login failure reason: {result.__repr__()}')
+        cdn = CDNClient(client)
+
+    # show extra files that are not in the manifest
+    def resolve_extra_files(extra_files:set[str], save_path:Path) -> str:
+        if args.regex_pattern:
+            return ''
+        elif len(extra_files) > 0:
+            msg = '\n'
+            for path in sorted(extra_files, key=lambda p: len(Path(p).parts), reverse=True):
+                msg += path
+                msg += ' '
                 if args.delete_unmatched:
                     path = save_path / path
                     if path.is_symlink() or path.is_file():
                         path.unlink()
                     elif path.is_dir():
                         path.rmdir()
-                else:
-                    tqdm.write(path, end=" ")
 
-            if not args.delete_unmatched:
-                tqdm.write('\n') # for \n
-                end = (f", Found {len(paths_in_dir)} entries above in the output directory that are not in the manifest!\n")
+            msg += (f"\n\n{len(extra_files)} {"entity" if len(extra_files) == 1 else "entities"} inside '{save_path}' {'deleted!' if args.delete_unmatched else 'that are not found in the manifest!'}\n")
+            return msg
+        else:
+            return ''
 
-        tqdm.write(f'All downloads completed', end=(end or "\n"))
-        return
+    for manifest in manifests:
+        depot_key = depot_keys[manifest.depot_id]
+        if separate_save_path:
+            save_path = Path(str(manifest.depot_id))
+            paths_in_dir = {
+                f.relative_to(save_path).as_posix()
+                for f in save_path.rglob('*')
+            }
+        with DepotDownloader(
+            manifest, depot_key,
+            cdn_client=cdn,
+            thread_num=args.thread,
+            save_path=save_path,
+            custom_servers=server_set,
+            level=args.level,
+            retry_num=args.retry,
+            max_servers=args.max_servers,
+            app_id=args.app_id,
+            cell_id=args.cell_id,
+            verify_integrity=args.verify_integrity) as d:
+            d.download(args.regex_pattern, paths_in_dir)
+        if save_path and separate_save_path:
+            tqdm.write(resolve_extra_files(paths_in_dir, save_path), end='')
+    if save_path and not separate_save_path:
+        tqdm.write('All downloads completed')
+        tqdm.write(resolve_extra_files(paths_in_dir, save_path), end='')
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        tqdm.write('All downloads cancelled')
