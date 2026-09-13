@@ -218,9 +218,9 @@ class FileDownload:
                         if data[2:3] != b'a':
                             raise SteamError("%s %s VZ: Invalid version: %s" % (self.file_path, chunk_id, repr(data[2:3])))
 
-                        vzfilter = lzma._decode_filter_properties(lzma.FILTER_LZMA1, data[7:12])
+                        vzfilter = lzma._decode_filter_properties(lzma.FILTER_LZMA1, data[7:12]) # type: ignore[reportAttributeAccessIssue]
                         vzdec = lzma.LZMADecompressor(lzma.FORMAT_RAW, filters=[vzfilter])
-                        checksum, decompressed_size = struct.unpack('<II', data[-10:-2])
+                        checksum, decompressed_size = struct.unpack_from('<II', data, -10)
                         # decompress_size is needed since lzma will sometime produce longer output
                         # [12:-9] is need as sometimes lzma will produce shorter output
                         # together they get us the right data
@@ -233,11 +233,10 @@ class FileDownload:
                         if data[3:4] != b'a':
                             raise SteamError("%s %s VSZ: Invalid version: %s" % (self.file_path, chunk_id, repr(data[2:3])))
 
-                        crc32_header = struct.unpack_from('<I', data, 4)[0]
-                        crc32_footer = struct.unpack_from('<I', data, -15)[0]
-                        size_decompressed = struct.unpack_from('<I', data, -11)[0]
-                        data = ZSTD_uncompress(data[8 : -15])[:size_decompressed]
-                        if crc32(data) != crc32_header != crc32_footer:
+                        #crc32_header = struct.unpack_from('<I', data, 4)[0]
+                        crc32_footer, decompressed_size = struct.unpack_from('<II', data, -15)
+                        data = ZSTD_uncompress(data[8 : -15])[:decompressed_size]
+                        if crc32(data) != crc32_footer:
                             raise SteamError("%s %s VSZ: CRC32 checksum doesn't match for decompressed data" % (self.file_path, chunk_id))
                     else:
                         with ZipFile(BytesIO(data)) as zf:
@@ -261,6 +260,7 @@ class FileDownload:
             time.sleep(1)  # Add a delay before retrying
             server, token = self.depot_downloader.get_content_server(rotate=True)
 
+        raise RuntimeError
 
 class SingletonDeque(deque):
     _instance = None
@@ -293,9 +293,9 @@ class SingletonDeque(deque):
         with self._lock:
             return super().popleft()
 
-    def remove(self):
+    def remove(self, value):
         with self._lock:
-            return super().remove()
+            return super().remove(value)
 
     def __len__(self):
         with self._lock:
@@ -342,9 +342,9 @@ class DepotDownloader:
                  thread_num=32,
                  retry_num=5,
                  max_servers=20,
-                 cdn_client:CDNClient=None,
+                 cdn_client:CDNClient|None=None,
                  custom_servers:Iterable[str]=[],
-                 save_path:os.PathLike=None,
+                 save_path:Path|str|None=None,
                  verify_integrity=False,
                  level=logging.INFO):
 
@@ -420,6 +420,8 @@ class DepotDownloader:
             try:
                 resp = webapi_get('IContentServerDirectoryService', 'GetServersForSteamPipe',
                                   params={'cell_id': cell_id or self.cell_id, 'max_servers': self.max_servers})
+                if not isinstance(resp, dict):
+                    raise ValueError(f"Not dict: {resp}")
                 content_servers = resp['response']['servers']
                 content_servers.sort(key=lambda x: (x['type'] != 'CDN', x['priority_class']))
             except Exception:
@@ -430,7 +432,7 @@ class DepotDownloader:
             ), content_servers):
                 server_str = f"{'https' if server['https_support'] == 'mandatory' else 'http'}://{server['host']}"
                 if not self.num_entries_in_client_list:
-                    self.num_entries_in_client_list = server.get('num_entries_in_client_list', 0)
+                    self.num_entries_in_client_list = int(server.get('num_entries_in_client_list', 0))
                 if server_str not in self.servers:
                     self.servers.append(server_str)
                     self.log.debug('Appended server: ' + server_str)
@@ -568,7 +570,7 @@ def main(new_args=None):
     global args
     if new_args:
         args = parser.parse_args(new_args)
-    paths_in_dir:set[str] = None
+    paths_in_dir:set[str] = set()
     manifests:list[DepotManifest] = []
     depot_keys:dict[int,bytes] = {}
     save_path = Path(args.output) if args.output else None
